@@ -1,12 +1,19 @@
 # Bare MD
+<p align="center">
+  <img src="/screenshot.png?raw=true" alt="Screenshot" width="600">
+</p>
+
 A vibecoded portable Markdown editor. Why another one? I tried a few popular editors and didn't like their ui or how they were made. This project is mostly for my own use, but if someone likes it, great.
+
 **Written in rust:**
 winit + wgpu backend, text renderer written from scratch (shaping with `rustybuzz`, glyph rasterisation with `fontdue`, an R8 glyph atlas and a single instanced-quad pipeline). No WebView, no Electron, no Tauri, no UI toolkit.
+
 **This editor is for you if you're looking for:**
 * A simple notepad-like editor just for .md files
 * Similar to the Obsidian experience
 * Live editing, no split view
 * Portability
+
 **What it's not / not planned right now:**
 * A complex professional editor
 * No plugins support
@@ -17,11 +24,12 @@ I wanted it to be mostly feature complete at release. I'll only add things if th
 
 ## Building
 Requirements: Rust **1.86+** and a working Vulkan/Metal/DX12/OpenGL driver.
+
 `cargo run --release`
 
 ## Keyboard
-|                                      |                                                                                                                                                                  |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|      |      |
+| ---- | ------ |
 | `Ctrl+N`, `Ctrl+T` / `Ctrl+W`        | new document / close tab                                                                                                                                         |
 | `Ctrl+O` / `Ctrl+Shift+O`            | open file / open folder                                                                                                                                          |
 | `Ctrl+S` / `Ctrl+Shift+S`            | save / save as                                                                                                                                                   |
