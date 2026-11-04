@@ -1,0 +1,42 @@
+[package]
+name = "bare-md"
+authors = "Quver"
+version = "1.0.0"
+edition = "2024"
+description = "Bare MD — a portable Markdown editor"
+
+# The library is called `bare_md` in code (crate names cannot contain a dash);
+# the binary keeps the product name and becomes `bare-md`.
+[lib]
+name = "bare_md"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bare-md"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+ropey = "1.6"
+rustybuzz = "0.20"
+fontdue = "0.9"
+unicode-linebreak = "0.1"
+arboard = { version = "3", default-features = false }
+png = "0.17"
+log = "0.4"
+env_logger = "0.11"
+jpeg-decoder = { version = "0.3", default-features = false }
+jxl-oxide = { version = "0.12", default-features = false }
+unicode-bidi = "0.3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+strip = true
+panic = "abort"
