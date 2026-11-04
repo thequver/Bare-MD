@@ -1,6 +1,6 @@
 [package]
 name = "bare-md"
-authors = "Quver"
+authors = ["Quver"]
 version = "1.0.0"
 edition = "2024"
 description = "Bare MD — a portable Markdown editor"
