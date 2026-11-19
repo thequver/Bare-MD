@@ -15,6 +15,8 @@ use crate::markdown::Block;
 /// wheel was dragging. A `LineDelta` of 1 is one notch on every platform, so this
 /// is the only number that has to change to make the wheel faster.
 pub const WHEEL_STEP: f32 = 120.0;
+/// How far a mouse-move while dragging a tab scrolls the strip at its edge, in pixels.
+pub const TAB_EDGE_SCROLL: f32 = 18.0;
 /// Pixels one wheel notch scrolls *sideways* (Shift+wheel) - a little less, because
 /// a line of text is much wider than it is tall.
 pub const WHEEL_STEP_X: f32 = 72.0;
@@ -145,6 +147,9 @@ impl App {
                     }
                     return true;
                 }
+                if self.tree_drag_update(pos) {
+                    return true;
+                }
                 if self.ws_drag_update(pos) {
                     return true;
                 }
@@ -197,6 +202,26 @@ impl App {
                         // nothing (a menu of editing commands over the file
                         // tree was never what the click was about).
                         match self.hits.at(self.mouse) {
+                            // A tab offers the tab commands (close, close others,
+                            // close all, rename) - and never closes on the click
+                            // itself, which is what right-click used to do.
+                            Some(Hit::Tab(i)) | Some(Hit::TabClose(i)) => {
+                                self.open_tab_menu(i, self.mouse)
+                            }
+                            // A row of the workspace tree: open, rename, duplicate,
+                            // copy, paste, delete.
+                            Some(Hit::SidebarEntry(i)) => {
+                                if let Some(entry) = self.ws.entries().get(i).cloned() {
+                                    self.open_tree_menu(entry.path, self.mouse);
+                                }
+                            }
+                            // The empty part of the panel below the last row: the
+                            // menu is about the folder the panel is showing, so "New
+                            // file" makes the file there.
+                            Some(Hit::SidebarBlank) => {
+                                let root = self.ws.root.clone();
+                                self.open_tree_menu(root, self.mouse);
+                            }
                             _ if self.editor_rect.contains(self.mouse) => {
                                 self.open_context_menu(self.mouse)
                             }
@@ -286,6 +311,19 @@ impl App {
                     if let Some(Dialog::About(a)) = &mut self.dialog {
                         a.scroll_by(step);
                     }
+                } else if self.tabbar_rect.contains(self.mouse) {
+                    // The wheel over the tab strip scrolls the *strip*. With more tabs
+                    // than fit, the newest ones are reached here - the wheel is what
+                    // the hand tries first, and it used to scroll the document
+                    // underneath a strip the pointer was not even over.
+                    let step = if dpy != 0.0 { -dpy.signum() } else { -dpx.signum() };
+                    let amount = if dpy.abs() > 0.5 || dpx.abs() > 0.5 {
+                        step * crate::app::App::TAB_SCROLL_STEP
+                    } else {
+                        0.0
+                    };
+                    self.scroll_tabs_by(amount);
+                    return true;
                 } else if input.modifiers.shift_key() {
                     self.tab_mut().scroll_x = (self.tab().scroll_x - dpx).max(0.0);
                 } else if self.minimap_rect.contains(self.mouse) && self.minimap_wheel(dpy) {
@@ -689,7 +727,9 @@ impl App {
     }
 
     /// Text input into find fields or dialog fields. Returns true when consumed.
-    fn route_text(&mut self, text: &str, _r: &mut Renderer) -> bool {
+    ///
+    /// Public so a test can drive the same door the window does.
+    pub fn route_text(&mut self, text: &str, _r: &mut Renderer) -> bool {
         match self.focus {
             Focus::FindQuery => {
                 let t = self.tab_mut();
@@ -717,6 +757,14 @@ impl App {
                     pk.insert_text(text);
                     return true;
                 }
+                // Every other dialog that owns a text field - the rename box - types
+                // through the same `TextField` accessor the caret, select-all, cut,
+                // copy and paste already use. Listing the boxes one by one is what
+                // left the rename box open, focused and deaf.
+                if let Some(f) = self.dialog_field_mut() {
+                    f.insert(text);
+                    return true;
+                }
                 false
             }
             Focus::Editor => false,
@@ -724,7 +772,7 @@ impl App {
     }
 
     /// Forward delete inside a find field. Returns true when consumed.
-    fn delete_forward_in_field(&mut self) -> bool {
+    pub fn delete_forward_in_field(&mut self) -> bool {
         match self.focus {
             Focus::FindQuery => {
                 self.tab_mut().find.delete_forward(crate::search::FindFocus::Query);
@@ -747,6 +795,10 @@ impl App {
                     pk.delete_forward();
                     return true;
                 }
+                if let Some(f) = self.dialog_field_mut() {
+                    f.delete_forward();
+                    return true;
+                }
                 false
             }
             Focus::Editor => false,
@@ -754,7 +806,7 @@ impl App {
     }
 
     /// Backspace inside a text field. Returns true when consumed.
-    fn route_backspace(&mut self) -> bool {
+    pub fn route_backspace(&mut self) -> bool {
         match self.focus {
             Focus::FindQuery => {
                 let t = self.tab_mut();
@@ -777,6 +829,10 @@ impl App {
                 }
                 if let Some(Dialog::Picker(pk)) = &mut self.dialog {
                     pk.backspace();
+                    return true;
+                }
+                if let Some(f) = self.dialog_field_mut() {
+                    f.backspace();
                     return true;
                 }
                 false
@@ -809,6 +865,17 @@ impl App {
     /// Left button released: finish a grip drag, otherwise fall back to the
     /// click behaviour of whatever is under the pointer.
     pub fn mouse_up(&mut self, r: &mut Renderer) {
+        if let Some(d) = self.tree_drag.take() {
+            if d.moved {
+                // A drag that actually moved a file is not a click on its row.
+                if let Some(dir) = d.over {
+                    self.move_into_folder(&d.path, &dir);
+                }
+                self.dragging_selection = false;
+                self.mouse_down = false;
+                return;
+            }
+        }
         if let Some(d) = self.ws_drag.take() {
             if d.moved {
                 // A drag that moved a chip is not a click on it.
@@ -906,6 +973,24 @@ impl App {
                 }
             }
         }
+        // The two right-click menus behave the same way: a press on one of their
+        // rows runs it (the match below), their own background only dismisses them,
+        // and a press anywhere else dismisses them and then falls through to
+        // whatever was clicked.
+        if self.tab_menu.is_some() || self.tree_menu.is_some() {
+            match &hit {
+                Some(Hit::TabMenu(_)) | Some(Hit::TreeMenu(_)) => {}
+                Some(Hit::MenuButton(MenuKind::Context)) => {
+                    self.tab_menu = None;
+                    self.tree_menu = None;
+                    return;
+                }
+                _ => {
+                    self.tab_menu = None;
+                    self.tree_menu = None;
+                }
+            }
+        }
         // The About box's scrollbar: a press grabs it, a move drags, a release lets go.
         if matches!(hit, Some(Hit::AboutScroll)) {
             self.about_drag_begin(pos);
@@ -966,22 +1051,64 @@ impl App {
                     index: self.active,
                     moved: false,
                     start: pos,
+                    hovered: Some(self.active),
                 });
             }
             Some(Hit::TabClose(i)) => {
                 self.close_tab(i);
             }
             Some(Hit::NewTab) => self.new_tab(),
+            Some(Hit::TabScrollLeft) => {
+                self.scroll_tabs_by(-crate::app::App::TAB_SCROLL_STEP);
+            }
+            Some(Hit::TabScrollRight) => {
+                self.scroll_tabs_by(crate::app::App::TAB_SCROLL_STEP);
+            }
             Some(Hit::Toolbar(action)) => {
                 self.run_toolbar(action, r);
             }
             Some(Hit::SidebarEntry(i)) => {
+                // …and remember that this press may turn into a drag onto a folder.
+                if let Some(e) = self.ws.entries().get(i).cloned() {
+                    self.tree_drag = Some(crate::app::TreeDrag {
+                        path: e.path,
+                        start: pos,
+                        moved: false,
+                        over: None,
+                    });
+                }
+                // Two clicks on the same row inside the double-click window are one
+                // double click. On a *file* that means rename - the file is already
+                // open from the first click, so the second has nothing else to do; on
+                // a folder it means "open/collapse it" once, not twice (a toggle run
+                // twice is a no-op, which looked like the row was dead).
                 let entry = self.ws.entries().get(i).cloned();
+                let mut double = false;
+                if let Some(e) = &entry {
+                    let now = std::time::Instant::now();
+                    let near = self
+                        .tree_click
+                        .as_ref()
+                        .map(|(p, t)| {
+                            *p == e.path
+                                && now.duration_since(*t).as_millis()
+                                    < crate::app::DOUBLE_CLICK_MS as u128
+                        })
+                        .unwrap_or(false);
+                    self.tree_click = if near { None } else { Some((e.path.clone(), now)) };
+                    double = near;
+                }
                 if let Some(e) = entry {
+                    if double && !e.is_dir {
+                        self.open_rename(crate::app::RenameTarget::Entry(e.path.clone()));
+                        return;
+                    }
                     if e.is_dir {
                         self.ws.toggle(&e.path);
                     } else {
-                        self.open_path(&e.path);
+                        if !double {
+                            self.open_path(&e.path);
+                        }
                         self.focus = Focus::Editor;
                     }
                 }
@@ -1231,9 +1358,33 @@ impl App {
                     Err(e) => self.set_status(format!("Could not save the licences: {e}")),
                 }
             }
+            Some(Hit::DialogRenameField) => {
+                self.focus = Focus::Dialog;
+                self.place_field_caret(Hit::DialogRenameField, pos.0, r, false);
+                self.field_drag = Some(Hit::DialogRenameField);
+            }
+            Some(Hit::DialogRenameOk) => self.commit_rename(),
+            // The action has to be read **before** the menu is closed: the menus are
+            // their own storage, so clearing one and then asking it for the entry that
+            // was clicked gives nothing back, and every row of both menus did nothing
+            // at all. (`run_tab_menu` / `run_tree_menu` take the menu themselves, which
+            // is what closes it.)
+            Some(Hit::TabMenu(i)) => {
+                if let Some(action) = self.tab_menu_entries().get(i).map(|(_, a)| *a) {
+                    self.run_tab_menu(action);
+                }
+            }
+            Some(Hit::TreeMenu(i)) => {
+                if let Some(action) = self.tree_menu_entries().get(i).map(|(_, a)| *a) {
+                    self.run_tree_menu(action);
+                }
+            }
             Some(Hit::DialogConfirm) => self.dialog_confirm(r),
             Some(Hit::DialogCancel) => {
                 self.dialog = None;
+                // Cancelling one question stops "close others" / "close all" here
+                // rather than skipping the tab and carrying on.
+                self.pending_close = None;
                 self.focus = Focus::Editor;
             }
             Some(Hit::DialogNameField) => {
@@ -1282,6 +1433,9 @@ impl App {
             }
             // Grips are handled on press (drag) and on release (menu); see above.
             Some(Hit::RowGrip(_, _)) | Some(Hit::ColGrip(_, _)) | Some(Hit::OutlineGrip(_)) => {}
+            // The panel's empty part only means something to a right-click, which is
+            // handled before the left button ever gets here.
+            Some(Hit::SidebarBlank) => {}
             Some(Hit::DialogPlaces(_)) | None => {}
         }
     }
@@ -1444,6 +1598,15 @@ impl App {
                 let on = self.toggle_wrap();
                 self.set_status(if on { "Soft wrap on" } else { "Soft wrap off" });
             }
+            RevealInWorkspace => {
+                match self.tab().doc.path.clone() {
+                    Some(p) => {
+                        self.attach_folder_of(&p);
+                        self.after_navigation(r);
+                    }
+                    None => self.set_status("This document has not been saved yet"),
+                }
+            }
             ToggleTheme => {
                 self.toggle_theme();
             }
@@ -1453,12 +1616,23 @@ impl App {
         }
     }
 
-    fn dialog_confirm(&mut self, r: &mut Renderer) {
+    pub fn dialog_confirm(&mut self, r: &mut Renderer) {
         let Some(dialog) = self.dialog.take() else { return };
         match dialog {
             Dialog::Confirm { on_yes, .. } => match on_yes {
                 ConfirmAction::CloseTab(i) => {
                     self.force_close_tab(i);
+                    // A "close others" / "close all" that was waiting on this answer
+                    // carries on with the tabs it had left. The list is ascending and
+                    // is worked from the back, so the indices below the one just
+                    // removed are still the same tabs.
+                    if let Some(rest) = self.pending_close.take() {
+                        self.resume_close(rest);
+                    }
+                    self.focus = Focus::Editor;
+                }
+                ConfirmAction::DeletePath(p) => {
+                    self.delete_path(&p);
                     self.focus = Focus::Editor;
                 }
                 ConfirmAction::Quit => {
@@ -1471,6 +1645,12 @@ impl App {
                 self.active = ec.tab.min(self.tabs.len().saturating_sub(1));
                 self.reload_file();
                 self.focus = Focus::Editor;
+            }
+            Dialog::Rename(box_) => {
+                // Enter in the rename box renames - the box stays open on an error,
+                // so put it back before committing.
+                self.dialog = Some(Dialog::Rename(box_));
+                self.commit_rename();
             }
             Dialog::About(_) => {
                 // Enter closes the box, like Escape does.
@@ -1760,6 +1940,31 @@ impl App {
         }
     }
 
+    /// Move a file out of the tree and over the folders in it while it is dragged.
+    ///
+    /// The drag says which folder would take it, and the drop is what moves it: a
+    /// drag that ends anywhere else (or a stray release) moves nothing. Rows are
+    /// read from the painter's published rects, so what lights up is exactly the row
+    /// under the pointer.
+    pub fn tree_drag_update(&mut self, pos: (f32, f32)) -> bool {
+        let Some(mut d) = self.tree_drag.clone() else { return false };
+        if !self.mouse_down {
+            self.tree_drag = None;
+            return false;
+        }
+        let (dx, dy) = (pos.0 - d.start.0, pos.1 - d.start.1);
+        if !d.moved && dx.abs() < 5.0 && dy.abs() < 5.0 {
+            return false;
+        }
+        d.moved = true;
+        // The folder under the pointer: a row, the root's own row (the address chip),
+        // or the blank part of the panel - which is how a file gets back out of a
+        // folder and into the root.
+        d.over = self.drop_target_at(pos, &d.path);
+        self.tree_drag = Some(d);
+        true
+    }
+
     /// Move a workspace tab along the sidebar strip while it is being dragged.
     pub fn ws_drag_update(&mut self, pos: (f32, f32)) -> bool {
         let Some(mut d) = self.ws_drag else { return false };
@@ -1804,19 +2009,40 @@ impl App {
             return false;
         }
         d.moved = true;
+        // Dragging along the strip scrolls it as well as reordering: with more tabs
+        // than fit, a drag towards the edge has to bring the ones that are off screen
+        // into reach, or a tab could never be dragged onto a neighbour it cannot see.
+        if pos.0 > self.tab_strip_right - 24.0 {
+            self.scroll_tabs_by(TAB_EDGE_SCROLL);
+        } else if pos.0 < self.text_rect.x + 24.0 {
+            self.scroll_tabs_by(-TAB_EDGE_SCROLL);
+        }
         // Which tab is the pointer over now?
         let target = self
             .tab_rects
             .iter()
             .position(|r| pos.0 >= r.x && pos.0 <= r.right())
             .unwrap_or_else(|| {
-                if self.tab_rects.last().map(|r| pos.0 > r.right()).unwrap_or(false) {
+                // Past the last chip *drawn*: only the view controls are out there,
+                // so the drag means "all the way to the end" only when the strip was
+                // cut short by the controls. Otherwise it is the empty part of the
+                // strip and the tab goes back to the front.
+                let past_last = self.tab_rects.last().map(|r| pos.0 > r.right()).unwrap_or(false);
+                let cut_short = self
+                    .tab_rects
+                    .last()
+                    .map(|r| r.right() >= self.tab_strip_right - 1.0)
+                    .unwrap_or(false);
+                if past_last && cut_short {
                     self.tab_rects.len().saturating_sub(1)
+                } else if past_last {
+                    0
                 } else {
                     0
                 }
             })
             .min(self.tabs.len().saturating_sub(1));
+        d.hovered = Some(target);
         if target != d.index && d.index < self.tabs.len() {
             let tab = self.tabs.remove(d.index);
             self.tabs.insert(target, tab);
