@@ -2550,7 +2550,18 @@ fn right_click_does_not_close_a_tab() {
     h.app.handle_event(&button(ElementState::Released), &mut h.r, &mut input);
     h.draw();
     assert_eq!(h.app.tabs.len(), before, "right click closed the tab");
-    assert!(h.app.menu.is_none(), "a right click on the tab strip opened a menu");
+    // (75) …and what it opens is the *tab* menu - close, close others, close all,
+    // rename - not the document's: a menu of editing commands over a tab was never
+    // what the click was about.
+    assert!(h.app.tab_menu.is_some(), "a right click on a tab opened no tab menu");
+    assert!(h.app.menu.is_none(), "a right click on a tab opened the document menu");
+    assert!(
+        h.app.tab_menu_entries().iter().any(|(l, _)| l == "Close others"),
+        "the tab menu is missing its commands"
+    );
+    // Dismiss it so the rest of the test presses the close button, not the menu.
+    h.app.tab_menu = None;
+    h.draw();
     // The tab's own close button still works.
     let close = h.app.hits.find(|hit| matches!(hit, Hit::TabClose(_)))
         .expect("a tab close button");
@@ -8444,4 +8455,1144 @@ fn a_click_in_the_strip_right_of_the_text_lands_at_the_end_of_the_row() {
             "the click on row {row} did not land at the end of that row"
         );
     }
+}
+
+// ---------------------------------------------------------------- round 74
+
+/// (74.1) However many tabs are open, none of them reaches the view controls -
+/// Find, the mode switch and the chips - and none of them covers the `+`.
+///
+/// The strip used to reserve a guessed 220 px for a lane that had grown to more
+/// than twice that, so the last tabs were drawn on top of the controls.
+#[test]
+fn tabs_never_reach_the_view_controls() {
+    let mut h = harness("r74-tab-lane");
+    // Names long enough to need the widest chip the strip allows.
+    for i in 0..30 {
+        h.type_str(&format!("doc {i}"));
+        h.app.new_tab();
+        h.draw();
+        h.type_str(&format!(
+            "a fairly long document title number {i} so the chips are wide"
+        ));
+        h.draw();
+    }
+    assert!(h.app.tabs.len() > 25, "the fixture did not open many tabs");
+    // Where the controls really are: the Find button's own rect.
+    let find = h
+        .app
+        .hits
+        .find(|hit| *hit == Hit::Toolbar(ToolbarAction::FindReplace))
+        .expect("the Find button");
+    let lane_left = bare_md::ui::view_lane_left(h.app.tabbar_rect);
+    assert!(
+        (find.x - lane_left).abs() < 2.0,
+        "the lane's measured left edge ({lane_left}) is not where Find is ({})",
+        find.x
+    );
+    // A chip may still be *drawn* past the lane - it is clipped there - but it may
+    // never start past it, and it may never win a click over a control. (76: the
+    // strip scrolls now, so the cut is made by the clip and by the hit order, not by
+    // stopping the layout short.)
+    for (i, r) in h.app.tab_rects.iter().enumerate() {
+        let on_screen = r.right() > h.app.tab_strip_left && r.x < h.app.tab_strip_right;
+        assert!(
+            !on_screen || r.x <= h.app.tab_strip_right + 1.0,
+            "tab {i} starts at {}, past the strip's edge {}",
+            r.x,
+            h.app.tab_strip_right
+        );
+    }
+    for hit in [ToolbarAction::ToggleRaw, ToolbarAction::FindReplace, ToolbarAction::ToggleTheme] {
+        let cr = h.app.hits.find(|x| *x == Hit::Toolbar(hit)).expect("a chip");
+        let at = h.app.hits.at((cr.x + cr.w * 0.5, cr.y + cr.h * 0.5));
+        assert!(
+            at == Some(Hit::Toolbar(hit)),
+            "a view control does not own the click at its own centre: {at:?}"
+        );
+    }
+}
+
+/// (74.2) The document menu offers "Open folder in workspace", and it opens the
+/// folder of the file being edited as a workspace tab with the file revealed.
+#[test]
+fn the_document_menu_opens_the_documents_folder_in_the_workspace() {
+    let mut h = harness("r74-reveal-menu");
+    let dir = h._dir.join("project");
+    std::fs::create_dir_all(dir.join("notes")).unwrap();
+    let file = dir.join("notes/plan.md");
+    std::fs::write(&file, "# Plan\n").unwrap();
+    h.app.open_path(&file);
+    h.draw();
+
+    h.app.open_context_menu((h.app.text_rect.x + 40.0, h.app.text_rect.y + 20.0));
+    let menu = h.app.menu.clone().expect("a context menu");
+    let item = menu
+        .entries
+        .iter()
+        .find(|e| e.label == "Open folder in workspace")
+        .expect("the menu has no way to open the document's folder");
+    let action = item.action.clone();
+    h.app.menu = None;
+    h.app.run_menu_action(action, &mut h.r);
+    h.draw();
+
+    assert_eq!(
+        h.app.ws.root,
+        dir.join("notes"),
+        "the panel did not move to the document's folder"
+    );
+    assert!(h.app.settings.sidebar_open, "the panel was left closed");
+    assert!(
+        h.app.ws.entries().iter().any(|e| e.path == file),
+        "the file is not visible in the tree"
+    );
+    assert!(
+        h.app.settings.workspaces.iter().any(|w| *w == dir.join("notes")),
+        "the folder was not remembered as a workspace tab"
+    );
+}
+
+/// (74.3) A file the editor is *started* with brings its folder into the workspace;
+/// a file opened later leaves the workspace alone.
+#[test]
+fn only_a_startup_file_brings_its_folder() {
+    let dir = std::env::temp_dir().join(format!("bare-md-reg-74-start-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let other = dir.join("other");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let first = home.join("readme.md");
+    let later = other.join("later.md");
+    std::fs::write(&first, "# One\n").unwrap();
+    std::fs::write(&later, "# Two\n").unwrap();
+
+    let paths = Paths {
+        data_dir: dir.join("data"),
+        config_file: dir.join("data/settings.conf"),
+        origin: "test".into(),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    let mut settings = Settings::default();
+    settings.workspace = Some(home.clone());
+    settings.theme = ThemeKind::Black;
+    let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::new(paths, settings, Session::default(), vec![first.clone()]);
+    let mut r = Renderer::offscreen(W, H, 1.0);
+    let _ = &mut r;
+    drop(gpu);
+
+    // The launch file's folder is the workspace, and the file is in the tree.
+    assert_eq!(app.ws.root, home, "the launch file's folder was not opened");
+    assert!(
+        app.ws.entries().iter().any(|e| e.path == first),
+        "the launch file is not visible in the tree"
+    );
+    // A file opened afterwards must not move the panel.
+    app.open_path(&later);
+    assert_eq!(app.ws.root, home, "opening a file later moved the workspace");
+    // …and neither may a file forwarded from another launch.
+    app.open_dropped(&later);
+    assert_eq!(app.ws.root, home, "a dropped file moved the workspace");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- round 75
+
+/// A workspace tree with a file in it, opened as the sandbox's workspace.
+fn tree_harness(tag: &str, files: &[&str]) -> (Harness, PathBuf) {
+    let mut h = harness(tag);
+    let dir = h._dir.join("tree");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    for f in files {
+        std::fs::write(dir.join(f), "# a file\n").unwrap();
+    }
+    h.app.ws.set_root(dir.clone());
+    h.app.settings.sidebar_open = true;
+    h.draw();
+    (h, dir)
+}
+
+/// Index of the tree row for `path`.
+fn tree_row(h: &Harness, path: &std::path::Path) -> usize {
+    h.app
+        .ws
+        .entries()
+        .iter()
+        .position(|e| e.path == path)
+        .unwrap_or_else(|| panic!("{} is not in the tree", path.display()))
+}
+
+/// (75.1) Right-click on a tab offers close / close others / close all / rename,
+/// and never closes the tab on the press itself.
+#[test]
+fn the_tab_menu_closes_and_renames() {
+    let mut h = harness("r75-tab-menu");
+    for i in 0..4 {
+        h.app.new_tab();
+        h.type_str(&format!("doc {i}"));
+    }
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 5);
+
+    // The menu is opened on tab 1 and covers tab 1.
+    h.app.open_tab_menu(1, (h.app.text_rect.x + 20.0, h.app.text_rect.y + 10.0));
+    let labels: Vec<String> = h.app.tab_menu_entries().into_iter().map(|(l, _)| l).collect();
+    for want in ["Close others", "Close all"] {
+        assert!(labels.iter().any(|l| l == want), "{want} is missing from {labels:?}");
+    }
+    // The × on the tab is "close this one"; a row repeating it was removed.
+    assert!(
+        !labels.iter().any(|l| l == "Close"),
+        "the tab menu still offers Close next to the tab's own ×: {labels:?}"
+    );
+    // "Close others" keeps tab 1 and takes the other four - asking first about the
+    // one with unsaved text, which is what the others have too.
+    h.app.run_tab_menu(bare_md::app::TabMenuAction::CloseOthers);
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Confirm { .. })),
+        "close others did not ask about the unsaved tabs"
+    );
+    // Answer "discard" to every question until the walk finishes.
+    for _ in 0..8 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.app.dialog_confirm(&mut h.r);
+    }
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 1, "close others left {} tabs", h.app.tabs.len());
+    assert_eq!(h.app.active, 0);
+    // Tab 1 is the first one typed into ("doc 0"): the walk kept the tab the menu was
+    // opened on, not whichever tab happened to be active.
+    assert_eq!(h.app.tab().doc.text(), "doc 0", "close others kept the wrong tab");
+
+    // …and "close all" ends with the one empty document (asking about the unsaved
+    // one on the way, exactly like the × would).
+    h.app.new_tab();
+    h.type_str("also unsaved");
+    h.draw();
+    h.app.close_all_tabs();
+    for _ in 0..8 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.app.dialog_confirm(&mut h.r);
+    }
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 1);
+    assert!(h.app.tab().doc.text().is_empty());
+}
+
+/// (75.1) "Close others" asks about unsaved text one tab at a time, and Cancel stops
+/// the whole thing - it does not leave half the tabs closed.
+#[test]
+fn close_others_asks_before_losing_unsaved_text() {
+    let mut h = harness("r75-close-others-dirty");
+    h.type_str("keep me");
+    h.app.new_tab();
+    h.type_str("dirty one");
+    h.app.new_tab();
+    h.type_str("dirty two");
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 3);
+
+    h.app.active = 0;
+    h.app.close_other_tabs(0);
+    // Two dirty tabs -> a question, and nothing closed yet.
+    assert!(matches!(h.app.dialog, Some(bare_md::app::Dialog::Confirm { .. })));
+    assert_eq!(h.app.tabs.len(), 3);
+    // Cancel: everything stays.
+    h.app.dialog = None;
+    h.app.pending_close = None;
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 3, "cancel still closed tabs");
+    assert_eq!(h.app.tab().doc.text(), "keep me");
+}
+
+/// (75.1) Renaming a document tab renames the file and keeps the tab on it.
+#[test]
+fn a_tab_can_be_renamed() {
+    let mut h = harness("r75-tab-rename");
+    let dir = h._dir.join("ren");
+    std::fs::create_dir_all(&dir).unwrap();
+    let old = dir.join("old-name.md");
+    std::fs::write(&old, "# Old\n").unwrap();
+    h.app.open_path(&old);
+    h.draw();
+
+    h.app.open_rename(bare_md::app::RenameTarget::Tab(old.clone()));
+    let Some(bare_md::app::Dialog::Rename(mut box_)) = h.app.dialog.take() else {
+        panic!("no rename box");
+    };
+    // The stem is selected, so typing replaces the name and keeps the extension.
+    box_.field.set("new-name.md");
+    h.app.dialog = Some(bare_md::app::Dialog::Rename(box_));
+    h.app.commit_rename();
+    h.draw();
+
+    let new = dir.join("new-name.md");
+    assert!(new.exists(), "the file was not renamed on disk");
+    assert!(!old.exists());
+    assert_eq!(h.app.tab().doc.path.as_deref(), Some(new.as_path()), "the tab kept the old path");
+    assert_eq!(h.app.tab().title(), "new-name.md");
+    assert!(h.app.dialog.is_none());
+    // A name that is taken is refused, and the box stays open to say so.
+    h.app.open_rename(bare_md::app::RenameTarget::Tab(new.clone()));
+    if let Some(bare_md::app::Dialog::Rename(box_)) = &mut h.app.dialog {
+        box_.field.set("old-name.md");
+        std::fs::write(dir.join("old-name.md"), "x").unwrap();
+    }
+    h.app.commit_rename();
+    assert!(h.app.dialog.is_some(), "the box closed although the rename failed");
+    assert!(!new.exists() || h.app.tab().doc.path.as_deref() == Some(new.as_path()));
+}
+
+/// (75.2) Double-clicking a file in the workspace tree opens the rename box.
+#[test]
+fn a_double_click_in_the_tree_renames_the_file() {
+    let (mut h, dir) = tree_harness("r75-tree-double", &["note.md"]);
+    let file = dir.join("note.md");
+    let row = tree_row(&h, &file);
+    let r = h
+        .app
+        .hits
+        .find(|hit| *hit == Hit::SidebarEntry(row))
+        .expect("the row is not clickable");
+    let c = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+    // Two clicks in quick succession.
+    h.click_full(c);
+    h.click_full(c);
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Rename(_))),
+        "a double click did not open the rename box"
+    );
+    let Some(bare_md::app::Dialog::Rename(box_)) = &mut h.app.dialog else { unreachable!() };
+    box_.field.set("renamed.md");
+    h.app.commit_rename();
+    h.draw();
+    assert!(dir.join("renamed.md").exists(), "the rename did not reach the disk");
+    assert!(!file.exists());
+}
+
+/// (75.3) The tree's menu offers open / rename / duplicate / copy / paste / delete,
+/// and the commands do what they say.
+#[test]
+fn the_tree_menu_duplicates_copies_pastes_and_deletes() {
+    let (mut h, dir) = tree_harness("r75-tree-menu", &["one.md"]);
+    let file = dir.join("one.md");
+    std::fs::write(&file, "the text\n").unwrap();
+
+    // Duplicate: a copy next to it, same contents.
+    h.app.run_tree_menu_for_test(file.clone(), bare_md::app::TreeMenuAction::Duplicate);
+    let copy = dir.join("one copy.md");
+    assert!(copy.exists(), "duplicate made no copy");
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "the text\n");
+
+    // Copy, then paste into the sub-folder.
+    h.app.run_tree_menu_for_test(file.clone(), bare_md::app::TreeMenuAction::Copy);
+    h.app.run_tree_menu_for_test(dir.join("sub"), bare_md::app::TreeMenuAction::Paste);
+    assert!(dir.join("sub/one.md").exists(), "paste did not write into the folder");
+
+    // Paste again into the same folder: a free name, not an overwrite.
+    h.app.run_tree_menu_for_test(dir.join("sub"), bare_md::app::TreeMenuAction::Paste);
+    assert!(dir.join("sub/one 2.md").exists(), "a second paste overwrote the first");
+
+    // The menu itself, as it is offered.
+    h.app.open_tree_menu(file.clone(), (10.0, 10.0));
+    let labels: Vec<String> = h.app.tree_menu_entries().into_iter().map(|(l, _)| l).collect();
+    for want in ["Open", "Rename", "Duplicate", "Copy", "Paste", "Delete"] {
+        assert!(labels.iter().any(|l| l == want), "{want} is missing from {labels:?}");
+    }
+
+    // Delete asks first, then removes the file and closes the tab that showed it.
+    h.app.open_path(&file);
+    h.draw();
+    assert_eq!(h.app.tabs.iter().filter(|t| t.doc.path.as_deref() == Some(file.as_path())).count(), 1);
+    h.app.run_tree_menu_for_test(file.clone(), bare_md::app::TreeMenuAction::Delete);
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Confirm { .. })),
+        "delete did not ask"
+    );
+    assert!(file.exists(), "delete removed the file before the question was answered");
+    h.app.delete_path(&file);
+    h.app.dialog = None;
+    h.draw();
+    assert!(!file.exists(), "the file is still there");
+    assert!(
+        !h.app.tabs.iter().any(|t| t.doc.path.as_deref() == Some(file.as_path())),
+        "the tab of the deleted file is still open"
+    );
+}
+
+/// (75.3) Deleting a folder takes the trees and tabs under it with it.
+#[test]
+fn deleting_a_folder_closes_what_was_open_inside_it() {
+    let (mut h, dir) = tree_harness("r75-delete-folder", &[]);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let inner = dir.join("sub/inner.md");
+    std::fs::write(&inner, "# inner\n").unwrap();
+    h.app.open_path(&inner);
+    h.draw();
+    assert!(h.app.tabs.iter().any(|t| t.doc.path.as_deref() == Some(inner.as_path())));
+
+    h.app.delete_path(&dir.join("sub"));
+    h.draw();
+    assert!(!dir.join("sub").exists());
+    assert!(
+        !h.app.tabs.iter().any(|t| t.doc.path.as_deref() == Some(inner.as_path())),
+        "a tab inside the deleted folder is still open"
+    );
+}
+
+/// (76) With more tabs than fit, the strip scrolls: the newest tabs are reached by
+/// the wheel, the chevrons and `Ctrl+Tab`, not lost past the edge.
+///
+/// The lane fix stopped the tabs from running under the view controls by simply
+/// not drawing past them, which made the newest tabs unreachable.
+#[test]
+fn a_full_tab_strip_scrolls_to_its_last_tabs() {
+    let mut h = harness("r76-tab-strip-scroll");
+    for i in 0..24 {
+        h.type_str(&format!("document number {i} with a longish name"));
+        h.app.new_tab();
+    }
+    h.draw();
+    let n = h.app.tabs.len();
+    assert!(n > 20, "the fixture opened only {n} tabs");
+    let strip_right = h.app.tab_strip_right;
+    assert!(h.app.tab_scroll_max > 0.0, "the strip claims it has nothing to scroll");
+
+    // A newly opened tab is scrolled into view by the next frame, which is the point
+    // of the "+" button; go back to the start of the strip to see what is hidden.
+    h.app.active = 0;
+    h.app.pending_reveal_tab = true;
+    h.draw();
+    // Revealing the first tab brings the strip (nearly) back to its start, and no
+    // chip *begins* past the lane's edge: past it is clipped, and a chip that starts
+    // there would be a chip drawn over the controls.
+    assert!(
+        h.app.tab_scroll <= App::TAB_SCROLL_STEP,
+        "revealing the first tab left the strip at {}",
+        h.app.tab_scroll
+    );
+    // Chips past the right edge exist - that is what "the strip is full" means - and
+    // they are clipped there; who owns a click at the controls is checked by
+    // `tabs_never_reach_the_view_controls`.
+    let hidden = h.app.tab_rects.iter().filter(|r| r.x >= strip_right).count();
+    assert!(hidden > 0, "no chip is past the edge, so there is nothing to scroll to");
+
+    // Scrolling to the end brings the last tab's chip into the visible strip.
+    h.app.scroll_tabs_by(h.app.tab_scroll_max + 1000.0);
+    h.draw();
+    assert!(
+        (h.app.tab_scroll - h.app.tab_scroll_max).abs() < 0.5,
+        "the strip did not stop at its end: {} of {}",
+        h.app.tab_scroll,
+        h.app.tab_scroll_max
+    );
+    let last = *h.app.tab_rects.last().expect("no chips");
+    assert!(
+        last.right() <= strip_right + 1.0 && last.right() > strip_right - 220.0,
+        "the last chip is not inside the strip after scrolling: {last:?} vs {strip_right}"
+    );
+    // Off-screen chips are recorded at negative x (they are scrolled out to the
+    // left) - what matters is that the *visible* ones never cover the controls.
+    for (i, r) in h.app.tab_rects.iter().enumerate() {
+        if r.right() <= h.app.tab_strip_left || r.x >= strip_right {
+            continue;
+        }
+        let cr = h
+            .app
+            .hits
+            .find(|x| *x == Hit::Toolbar(ToolbarAction::FindReplace))
+            .expect("Find");
+        assert!(r.x <= cr.x, "visible tab {i} starts past the controls");
+    }
+
+    // Back to the start, and "reveal the active tab" scrolls it into view: this is
+    // what Ctrl+Tab and a newly opened file rely on.
+    h.app.tab_scroll = 0.0;
+    h.draw();
+    h.app.active = n - 1;
+    h.app.pending_reveal_tab = true;
+    h.draw();
+    let active_r = h.app.tab_rects[h.app.active];
+    assert!(
+        active_r.x >= h.app.text_rect.x - 24.0 && active_r.right() <= strip_right + 1.0,
+        "the active tab was not scrolled into view: {active_r:?}"
+    );
+}
+
+/// (76) The wheel over the tab strip scrolls the strip, not the document, and the
+/// chevrons scroll by a step.
+#[test]
+fn the_wheel_over_the_strip_scrolls_the_strip() {
+    let mut h = harness("r76-wheel-strip");
+    for _ in 0..24 {
+        h.app.new_tab();
+    }
+    h.draw();
+    let before_scroll = h.app.tab().scroll;
+    let strip = h.app.tabbar_rect;
+    h.app.mouse = (strip.x + strip.w * 0.35, strip.y + strip.h * 0.5);
+    h.draw();
+    let mut input = bare_md::input::InputState::default();
+    use winit::event::{MouseScrollDelta, WindowEvent};
+    let wheel = |dy: f32| WindowEvent::MouseWheel {
+        delta: MouseScrollDelta::LineDelta(0.0, dy),
+        device_id: winit::event::DeviceId::dummy(),
+        phase: winit::event::TouchPhase::Moved,
+    };
+    h.app.handle_event(&wheel(-1.0), &mut h.r, &mut input);
+    h.draw();
+    assert!(
+        h.app.tab_scroll > 0.0,
+        "the wheel over the strip did not scroll the strip"
+    );
+    assert_eq!(h.app.tab().scroll, before_scroll, "the wheel over the strip scrolled the document");
+
+    // The chevron scrolls back by one step.
+    let step = bare_md::app::App::TAB_SCROLL_STEP;
+    let was = h.app.tab_scroll;
+    h.app.scroll_tabs_by(-step);
+    h.draw();
+    assert!((h.app.tab_scroll - (was - step).max(0.0)).abs() < 0.5);
+}
+
+/// (77) Clicking an entry of a right-click menu runs it - through the **hit map**, the
+/// way a mouse does.
+///
+/// The round-75 menus were complete and drew correctly, and every row of both did
+/// nothing: the dispatcher cleared the menu and only then asked the (now empty) menu
+/// which entry had been clicked. The unit tests called `run_tab_menu` /
+/// `run_tree_menu` directly, so they never went through that code. This one clicks
+/// the pixels.
+#[test]
+fn a_click_on_a_menu_row_runs_that_row() {
+    let mut h = harness("r77-menu-clicks");
+    // Two tabs, so "close others" has something to close.
+    h.type_str("first");
+    h.app.new_tab();
+    h.type_str("second");
+    h.draw();
+
+    // ---- the tab menu ----
+    h.app.open_tab_menu(0, (h.app.text_rect.x + 30.0, h.app.text_rect.y + 20.0));
+    h.draw();
+    let labels: Vec<String> = h.app.tab_menu_entries().into_iter().map(|(l, _)| l).collect();
+    // These tabs are untitled buffers, so the menu offers the three closes and no
+    // Rename - which is the rule (a buffer without a file has no name to change).
+    assert!(!labels.iter().any(|l| l.starts_with("Rename")), "Rename offered for an untitled tab");
+    let others_at = labels.iter().position(|l| l == "Close others").expect("Close others");
+    let row = h.app.hits.find(|hit| *hit == Hit::TabMenu(others_at)).expect("a clickable row");
+    let c = (row.x + row.w * 0.5, row.y + row.h * 0.5);
+    h.click_full(c);
+    h.draw();
+    // The click ran the command; both tabs hold unsaved text, so it asks before
+    // closing them - and answering "discard" finishes the job.
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Confirm { .. })),
+        "clicking 'Close others' ran nothing at all"
+    );
+    for _ in 0..8 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.app.dialog_confirm(&mut h.r);
+    }
+    h.draw();
+    assert_eq!(h.app.tabs.len(), 1, "clicking 'Close others' did nothing");
+    assert!(h.app.tab_menu.is_none(), "the menu stayed open after its row was clicked");
+
+    // ---- the tree menu: Rename through the pixels ----
+    let dir = h._dir.join("tree77");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("thing.md");
+    std::fs::write(&file, "# thing\n").unwrap();
+    h.app.ws.set_root(dir.clone());
+    h.app.settings.sidebar_open = true;
+    h.draw();
+    h.app.open_tree_menu(file.clone(), (h.app.text_rect.x + 30.0, h.app.text_rect.y + 20.0));
+    h.draw();
+    let tlabels: Vec<String> = h.app.tree_menu_entries().into_iter().map(|(l, _)| l).collect();
+    let ren = tlabels.iter().position(|l| l == "Rename").expect("Rename");
+    let row = h.app.hits.find(|hit| *hit == Hit::TreeMenu(ren)).expect("a clickable tree row");
+    let c = (row.x + row.w * 0.5, row.y + row.h * 0.5);
+    h.click_full(c);
+    h.draw();
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Rename(_))),
+        "clicking 'Rename' in the tree menu did nothing"
+    );
+}
+
+/// (77) Rename on a tab that has a file: right-click the tab, click "Rename…" in the
+/// menu, get the rename box. This is the exact path that did nothing.
+#[test]
+fn rename_on_a_tab_opens_the_box_when_clicked() {
+    let mut h = harness("r77-tab-rename-click");
+    let dir = h._dir.join("r77");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("saved.md");
+    std::fs::write(&file, "# saved\n").unwrap();
+    h.app.open_path(&file);
+    h.draw();
+
+    // Right-click the tab itself.
+    let tab = h
+        .app
+        .hits
+        .find(|hit| *hit == Hit::Tab(1))
+        .expect("the saved document's tab");
+    // Rename is only offered for the tab that has a file - pointer in the middle of
+    // the *saved* document's chip.
+    let tp = (tab.x + tab.w * 0.5, tab.y + tab.h * 0.5);
+    h.app.mouse = tp;
+    h.draw();
+    let mut input = bare_md::input::InputState::default();
+    use winit::event::{ElementState, MouseButton, WindowEvent};
+    h.app.handle_event(
+        &WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button: MouseButton::Right,
+            device_id: winit::event::DeviceId::dummy(),
+        },
+        &mut h.r,
+        &mut input,
+    );
+    h.draw();
+    assert!(h.app.tab_menu.is_some(), "the right click opened no tab menu");
+
+    // Its Rename row is there, and clicking it opens the box.
+    let labels: Vec<String> = h.app.tab_menu_entries().into_iter().map(|(l, _)| l).collect();
+    let ren = labels.iter().position(|l| l.starts_with("Rename")).expect("Rename row");
+    let row = h.app.hits.find(|hit| *hit == Hit::TabMenu(ren)).expect("a clickable row");
+    let c = (row.x + row.w * 0.5, row.y + row.h * 0.5);
+    h.click_full(c);
+    h.draw();
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Rename(_))),
+        "clicking Rename on a tab did nothing"
+    );
+    // …and the box renames the file.
+    let Some(bare_md::app::Dialog::Rename(box_)) = &mut h.app.dialog else { unreachable!() };
+    box_.field.set("renamed-tab.md");
+    h.app.commit_rename();
+    h.draw();
+    assert!(dir.join("renamed-tab.md").exists(), "the rename never happened");
+}
+
+/// The rename box is a text field: what you type has to land in it.
+///
+/// It used to open, show the old name and then ignore the keyboard - `route_text`,
+/// backspace and delete-forward knew the colour box and the folder dialog, and
+/// returned `false` for everything else, so every key went to the document underneath.
+#[test]
+fn the_rename_box_takes_what_is_typed_into_it() {
+    let mut h = harness("r77-rename-types");
+    let dir = h._dir.join("r77t");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("before.md");
+    std::fs::write(&file, "# before\n").unwrap();
+    h.app.open_rename(bare_md::app::RenameTarget::Entry(file.clone()));
+    h.draw();
+
+    let text = |h: &Harness| h.app.dialog_field().map(|f| f.text.clone()).unwrap_or_default();
+
+    // Typed text (the IME commit path, which is where winit delivers characters).
+    h.type_into_find("after");
+    assert!(
+        matches!(h.app.dialog, Some(bare_md::app::Dialog::Rename(_))),
+        "typing dismissed the box"
+    );
+    assert_eq!(text(&h), "after.md", "typing into the rename box did not reach it");
+
+    // Backspace and Delete edit it like any other field.
+    h.app.route_backspace();
+    assert_eq!(text(&h), "afte.md", "Backspace in the rename box did not reach it");
+    h.app.dialog_field_mut().unwrap().place_caret(0, false);
+    h.app.delete_forward_in_field();
+    assert_eq!(text(&h), "fte.md", "Delete in the rename box did not reach it");
+
+    // …and what ends up in the box is what gets renamed.
+    h.app.dialog_field_mut().unwrap().set("after.md");
+    h.app.commit_rename();
+    h.draw();
+    assert!(h._dir.join("r77t").join("after.md").exists(), "the box did not rename the file");
+}
+
+/// A document tab's own rename box is the same field, reached the other way.
+#[test]
+fn the_rename_box_in_a_document_title_takes_typing() {
+    let mut h = harness("r77-rename-types-doc");
+    let dir = h._dir.join("r77u");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("doc.md");
+    std::fs::write(&file, "x\n").unwrap();
+    h.app.open_path(&file);
+    h.draw();
+    h.app.open_rename(bare_md::app::RenameTarget::Tab(file.clone()));
+    h.draw();
+    assert!(matches!(h.app.dialog, Some(bare_md::app::Dialog::Rename(_))));
+    // The whole name is replaced by what is typed over it.
+    h.app.dialog_select_all();
+    h.type_into_find("typed.md");
+    let shown = h.app.dialog_field().map(|f| f.text.clone()).unwrap_or_default();
+    assert_eq!(shown, "typed.md", "typing went nowhere");
+    h.app.commit_rename();
+    h.draw();
+    assert!(dir.join("typed.md").exists(), "the tab's box did not rename the file");
+}
+
+// ---------------------------------------------------------------- round 78
+
+/// (78.1) The tab scroll chevrons sit in their own lanes: no chip is ever under one,
+/// and hovering a chevron does not light up a tab.
+#[test]
+fn the_scroll_chevrons_never_sit_on_a_tab() {
+    let mut h = harness("r78-chevron-lanes");
+    for i in 0..24 {
+        h.type_str(&format!("document number {i} with a longish name"));
+        h.app.new_tab();
+    }
+    h.draw();
+    assert!(h.app.tab_scroll_max > 0.0, "the strip has nothing to scroll");
+    // Half way along, both chevrons are on screen.
+    h.app.scroll_tabs_by(h.app.tab_scroll_max * 0.5);
+    h.draw();
+    let left = h.app.hits.find(|hit| *hit == Hit::TabScrollLeft).expect("no left chevron");
+    let right = h.app.hits.find(|hit| *hit == Hit::TabScrollRight).expect("no right chevron");
+
+    // No chip *draws* under either button: a chip scrolled half out of the strip is
+    // clipped at the lane, and the lane is where each button lives.
+    for (i, r) in h.app.tab_rects.iter().enumerate() {
+        let visible = Rect::new(
+            r.x.max(h.app.tab_strip_left),
+            r.y,
+            (r.right().min(right.x - 2.0) - r.x.max(h.app.tab_strip_left)).max(0.0),
+            r.h,
+        );
+        if visible.w <= 0.0 {
+            continue;
+        }
+        for (name, b) in [("left", left), ("right", right)] {
+            let overlap = visible.x < b.right() && b.x < visible.right();
+            assert!(!overlap, "tab {i} {visible:?} overlaps the {name} chevron {b:?}");
+        }
+    }
+
+    // Hovering the right chevron lights no tab: the tab nearest the button is not
+    // hovered, and no close button appears where the button is.
+    h.app.mouse = (right.x + right.w * 0.5, right.y + right.h * 0.5);
+    h.draw();
+    // No chip's *visible* part is under the pointer: the chips are clipped at the
+    // lane, so a chip that starts inside the lane is not drawn there at all.
+    let lane_left = h.app.tab_strip_left;
+    for (i, r) in h.app.tab_rects.iter().enumerate() {
+        let vis = Rect::new(
+            r.x.max(lane_left),
+            r.y,
+            (r.right().min(right.x - 2.0) - r.x.max(lane_left)).max(0.0),
+            r.h,
+        );
+        assert!(
+            !vis.contains(h.app.mouse),
+            "the pointer over the right chevron is inside tab {i}'s visible chip {vis:?}"
+        );
+    }
+    // …and the strip is not shifted by the lanes appearing: the first chip starts at
+    // the left lane, so the tab strip's left edge is a constant.
+    assert!(
+        (h.app.tab_strip_left - (h.app.tabbar_rect.x + bare_md::ui::TAB_LANE)).abs() < 0.6,
+        "the chips do not start at the lane: {} (bar x {})",
+        h.app.tab_strip_left,
+        h.app.tabbar_rect.x
+    );
+}
+
+/// (78.2) The × on a tab is a cross you can see: the glyph, not the button, grew.
+#[test]
+fn the_tab_close_glyph_is_bigger_than_it_was() {
+    const CHROME: &str = include_str!("../src/ui/chrome.rs");
+    let at = CHROME.find("pub fn chip_close").expect("no chip_close");
+    let body = &CHROME[at..(at + 700).min(CHROME.len())];
+    // The button is still 16 px and still 21 px from the chip's right edge…
+    assert!(body.contains("chip.right() - 21.0"), "the close button moved");
+    assert!(body.contains("16.0, 16.0"), "the close button changed size");
+    // …while the icon is inset by 1.5, not 4.5: a 7 px cross became a 13 px one.
+    assert!(
+        body.contains("cr.inset(1.5)"),
+        "the close glyph is still the old small one"
+    );
+    // And it is still drawn by the one function both tab rows use.
+    let mut h = harness("r78-close-glyph");
+    h.draw();
+    let cr = h.app.hits.find(|hit| matches!(hit, Hit::TabClose(_))).expect("a close button");
+    assert_eq!((cr.w, cr.h), (22.0, 20.0), "the close hit area changed: {cr:?}");
+}
+
+/// (78.3) A tab's right-click menu has no "Close" row: the × beside it is that.
+#[test]
+fn the_tab_menu_has_no_close_row() {
+    let mut h = harness("r78-no-close-row");
+    h.app.new_tab();
+    h.draw();
+    h.app.open_tab_menu(0, (200.0, 30.0));
+    let labels: Vec<String> = h.app.tab_menu_entries().into_iter().map(|(l, _)| l).collect();
+    assert!(!labels.iter().any(|l| l == "Close"), "{labels:?}");
+    for want in ["Close others", "Close all"] {
+        assert!(labels.iter().any(|l| l == want), "{want} is missing from {labels:?}");
+    }
+}
+
+/// (78.4) A right-click on the empty part of the workspace panel offers a new file in
+/// the folder the panel is showing, and running it creates the file there.
+#[test]
+fn a_right_click_on_the_panel_makes_a_file_in_that_folder() {
+    let (mut h, dir) = tree_harness("r78-new-file", &["one.md"]);
+    // The blank part of the panel: below the last row.
+    let blank = h
+        .app
+        .hits
+        .find(|hit| *hit == Hit::SidebarBlank)
+        .expect("the panel has no empty area registered");
+    let pos = (blank.x + blank.w * 0.5, blank.y + 10.0);
+    h.app.mouse = pos;
+    h.draw();
+    let mut input = bare_md::input::InputState::default();
+    use winit::event::{ElementState, MouseButton, WindowEvent};
+    h.app.handle_event(
+        &WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button: MouseButton::Right,
+            device_id: winit::event::DeviceId::dummy(),
+        },
+        &mut h.r,
+        &mut input,
+    );
+    h.draw();
+    let entries = h.app.tree_menu_entries();
+    assert!(!entries.is_empty(), "a right click on the empty panel opened no menu");
+    let (label, action) = entries[0].clone();
+    assert!(
+        label.starts_with("New file"),
+        "the first row is not \"New file\": {label}"
+    );
+    // The row says which folder it will use.
+    assert!(
+        label.contains("tree"),
+        "the row does not name the folder: {label}"
+    );
+    h.app.run_tree_menu(action);
+    h.draw();
+    assert!(dir.join("untitled.md").exists(), "no file was created in {}", dir.display());
+    // …and it is open in a tab, showing it.
+    assert_eq!(
+        h.app.tab().doc.path.as_deref(),
+        Some(dir.join("untitled.md").as_path()),
+        "the new file was not opened"
+    );
+
+    // A second one does not overwrite the first.
+    h.app.run_tree_menu_for_test(dir.clone(), bare_md::app::TreeMenuAction::NewFile);
+    assert!(dir.join("untitled 2.md").exists(), "the second new file reused the name");
+}
+
+/// (78.4b) The same command on a *file's* row creates the file in that file's folder,
+/// which is where the row's label says it will go.
+#[test]
+fn new_file_on_a_file_row_goes_into_its_folder() {
+    let (mut h, dir) = tree_harness("r78-new-file-row", &["one.md"]);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let one = dir.join("one.md");
+    h.app.run_tree_menu_for_test(one.clone(), bare_md::app::TreeMenuAction::NewFile);
+    assert!(dir.join("untitled.md").exists(), "not created next to the file");
+    h.app.run_tree_menu_for_test(dir.join("sub"), bare_md::app::TreeMenuAction::NewFile);
+    assert!(dir.join("sub").join("untitled.md").exists(), "not created inside the folder");
+}
+
+/// (78.5) A file can be dragged out of the tree onto a folder in it, and dropped there.
+#[test]
+fn a_file_dragged_onto_a_folder_moves_into_it() {
+    let (mut h, dir) = tree_harness("r78-drag-drop", &["move-me.md"]);
+    let src = dir.join("move-me.md");
+    let sub = dir.join("sub");
+    // Open the file so the tab that follows it can be checked too.
+    h.app.open_path(&src);
+    h.draw();
+    let from = tree_row(&h, &src);
+    let to = tree_row(&h, &sub);
+    assert!(
+        h.app.ws.entries()[from].path == src && h.app.ws.entries()[to].path == sub,
+        "the fixture's rows are not where they should be"
+    );
+    let row = h.app.sidebar_rows[from];
+    let target = h.app.sidebar_rows[to];
+    h.app.mouse = (row.x + 20.0, row.y + row.h * 0.5);
+    h.draw();
+    h.app.click(h.app.mouse, &mut h.r);
+    h.draw();
+    // Drag it over the folder: nothing moves yet, the folder says it would take it.
+    let over = (target.x + 30.0, target.y + target.h * 0.5);
+    h.app.mouse = over;
+    assert!(h.app.tree_drag_update(over), "the drag did not start");
+    h.draw();
+    assert_eq!(
+        h.app.tree_drag.as_ref().and_then(|d| d.over.clone()).as_deref(),
+        Some(sub.as_path()),
+        "the drag does not know which folder it is over"
+    );
+    assert!(src.exists(), "the file moved before the button came up");
+
+    // Drop.
+    h.app.mouse_up(&mut h.r);
+    h.draw();
+    assert!(!src.exists(), "the file did not leave its folder");
+    let moved = sub.join("move-me.md");
+    assert!(moved.exists(), "the file is not in the folder it was dropped on");
+    assert_eq!(
+        h.app.tab().doc.path.as_deref(),
+        Some(moved.as_path()),
+        "the open tab did not follow the file"
+    );
+    assert!(tree_row(&h, &moved) > 0, "the tree does not show the file in its new folder");
+}
+
+/// (78.5b) The three moves that would destroy something are refused, and a release
+/// that never moved anything moves nothing.
+#[test]
+fn a_drag_that_would_lose_a_file_does_nothing() {
+    let (mut h, dir) = tree_harness("r78-drag-refuse", &["keep.md"]);
+    let src = dir.join("keep.md");
+    let sub = dir.join("sub");
+    // A press-and-release with no travel is a click on the row, not a move to the
+    // folder the pointer happened to be over.
+    h.draw();
+    let row = h.app.sidebar_rows[tree_row(&h, &src)];
+    h.app.mouse = (row.x + 20.0, row.y + row.h * 0.5);
+    h.draw();
+    h.app.click(h.app.mouse, &mut h.r);
+    h.app.mouse_up(&mut h.r);
+    h.draw();
+    assert!(src.exists(), "a plain click moved the file");
+
+    // A folder into its own child would lose the folder.
+    let nested = sub.join("deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    h.app.ws.refresh();
+    h.draw();
+    h.app.move_into_folder(&sub, &nested);
+    assert!(sub.exists() && nested.exists(), "a folder was moved into its own child");
+    assert!(
+        h.app.status.contains("cannot move"),
+        "the refusal was silent: {:?}",
+        h.app.status
+    );
+
+    // Moving a file into the folder it already lives in is a no-op, not a copy.
+    h.app.move_into_folder(&src, &dir);
+    assert!(src.exists());
+    assert!(!dir.join("keep 2.md").exists(), "a no-op move made a duplicate");
+}
+
+// ---------------------------------------------------------------- round 79
+
+/// (79) A file dragged out of a folder and onto the bare panel goes back to the
+/// workspace root.
+///
+/// The first version of the drop could only find *rows* as targets, and the root
+/// has no row of its own - it is the address chip at the top of the panel - so a
+/// file could be put into a folder but never taken back out of one.
+#[test]
+fn a_file_can_be_dragged_back_to_the_root() {
+    let (mut h, dir) = tree_harness("r79-drag-back-to-root", &["other.md"]);
+    let sub = dir.join("sub");
+    let src = sub.join("leaf.md");
+    std::fs::write(&src, "# leaf\n").unwrap();
+    h.app.open_path(&src);
+    h.draw();
+    assert_eq!(
+        h.app.tab().doc.path.as_deref(),
+        Some(src.as_path()),
+        "the fixture did not open the file"
+    );
+
+    // The file lives in `sub`; drag it over the blank part of the panel.
+    let row = h.app.sidebar_rows[tree_row(&h, &src)];
+    h.app.mouse = (row.x + 20.0, row.y + row.h * 0.5);
+    h.draw();
+    h.app.click(h.app.mouse, &mut h.r);
+    h.draw();
+    let blank = h.app.sidebar_blank;
+    assert!(blank.h > 4.0, "the panel has no empty area to drop on: {blank:?}");
+    let over = (blank.x + blank.w * 0.5, blank.y + 8.0);
+    h.app.mouse = over;
+    assert!(h.app.tree_drag_update(over), "the drag did not start");
+    h.draw();
+    assert_eq!(
+        h.app.tree_drag.as_ref().and_then(|d| d.over.clone()).as_deref(),
+        Some(dir.as_path()),
+        "the blank panel is not the workspace root"
+    );
+    h.app.mouse_up(&mut h.r);
+    h.draw();
+    assert!(!src.exists(), "the file did not leave the folder");
+    let back = dir.join("leaf.md");
+    assert!(back.exists(), "the file is not back in the root");
+    assert_eq!(
+        h.app.tab().doc.path.as_deref(),
+        Some(back.as_path()),
+        "the open tab did not follow the file back to the root"
+    );
+}
+
+/// (79b) The address chip at the top of the panel is part of the panel, so a file
+/// can be dropped on it too.
+#[test]
+fn the_address_chip_is_the_roots_row_for_a_drag() {
+    let (mut h, dir) = tree_harness("r79-drag-root-chip", &["leaf.md"]);
+    let sub = dir.join("sub");
+    let src = sub.join("leaf.md");
+    std::fs::write(&src, "x\n").unwrap();
+    h.draw();
+    let chip = h.app.sidebar_root_row;
+    assert!(chip.h > 10.0, "no address chip was published: {chip:?}");
+
+    // Halfway down the chip is a hit for "go up", and it is still the root for a
+    // drop: the two meanings do not collide because the drag only reads the drop.
+    h.app.tree_drag = Some(bare_md::app::TreeDrag {
+        path: src.clone(),
+        start: (chip.x + 5.0, chip.y + 5.0),
+        moved: true,
+        over: None,
+    });
+    assert_eq!(
+        h.app.drop_target_at((chip.x + 40.0, chip.y + chip.h * 0.5), &src).as_deref(),
+        Some(dir.as_path()),
+        "the address chip is not a drop target for the root"
+    );
+    h.draw();
+    // The drag itself agrees with the query, and the drop does the move. Nothing is
+    // drawn for it: the panel is the target, not this row.
+    h.app.mouse_down = true;
+    h.app.mouse = (chip.x + 40.0, chip.y + chip.h * 0.5);
+    assert!(h.app.tree_drag_update(h.app.mouse), "the drag stopped tracking");
+    assert_eq!(
+        h.app.tree_drag.as_ref().and_then(|d| d.over.clone()).as_deref(),
+        Some(dir.as_path()),
+        "the chip did not claim the drag"
+    );
+    h.app.mouse_up(&mut h.r);
+    h.draw();
+    assert!(dir.join("leaf.md").exists(), "the drop on the chip did not move the file");
+    assert!(!src.exists());
+}
+
+/// (79c) A drop on the folder the file already lives in does nothing, and a drop on
+/// the file's own parent while it sits in the root is not a move to itself.
+#[test]
+fn dropping_a_file_where_it_already_is_does_nothing() {
+    let (mut h, dir) = tree_harness("r79-drop-noop", &["stay.md"]);
+    let src = dir.join("stay.md");
+    h.draw();
+    let blank = h.app.sidebar_blank;
+    let pos = (blank.x + 10.0, blank.y + 6.0);
+    assert_eq!(
+        h.app.drop_target_at(pos, &src).as_deref(),
+        Some(dir.as_path()),
+        "the root is not offered as a target"
+    );
+    // …but moving it into the folder it is already in is recognised as a no-op.
+    h.app.move_into_folder(&src, &dir);
+    assert!(src.exists());
+    assert!(!dir.join("stay 2.md").exists(), "a no-op move made a copy");
+    // A file cannot be dropped into itself, and a folder not into its own child.
+    assert_eq!(h.app.drop_target_at(pos, &dir), None, "a folder was offered itself");
+}
+
+// ---------------------------------------------------------------- round 80
+
+/// (80) The whole panel takes a drop: no special box, no caption, anywhere in it.
+#[test]
+fn the_whole_workspace_panel_takes_a_drop() {
+    let (mut h, dir) = tree_harness("r80-drop-anywhere", &["a.md", "b.md"]);
+    let sub = dir.join("sub");
+    let src = dir.join("a.md");
+    h.draw();
+    let panel = h.app.sidebar_rect;
+    assert!(panel.w > 50.0 && panel.h > 50.0, "no panel: {panel:?}");
+
+    // The root answers for every part of the panel that is not a folder row: the
+    // header, the address chip, the empty space below the list, the very edge.
+    let spots = [
+        (panel.x + 4.0, panel.y + 4.0),
+        (panel.x + panel.w * 0.5, panel.y + 40.0),
+        (h.app.sidebar_blank.x + 6.0, h.app.sidebar_blank.y + 6.0),
+        (panel.right() - 3.0, panel.bottom() - 3.0),
+    ];
+    for spot in spots {
+        assert_eq!(
+            h.app.drop_target_at(spot, &src).as_deref(),
+            Some(dir.as_path()),
+            "{spot:?} is not a drop for the root"
+        );
+    }
+
+    // A file's row means the folder that file is in, a folder's row means itself.
+    let a_row = h.app.sidebar_rows[tree_row(&h, &src)];
+    assert_eq!(
+        h.app.drop_target_at((a_row.x + 10.0, a_row.y + a_row.h * 0.5), &dir.join("b.md")).as_deref(),
+        Some(dir.as_path()),
+        "a file row is not its own folder"
+    );
+    let sub_row = h.app.sidebar_rows[tree_row(&h, &sub)];
+    assert_eq!(
+        h.app.drop_target_at((sub_row.x + 10.0, sub_row.y + sub_row.h * 0.5), &src).as_deref(),
+        Some(sub.as_path()),
+        "a folder row is not that folder"
+    );
+
+    // Outside the panel nothing is offered: a drag that wanders into the document
+    // does not quietly move a file into the root.
+    assert_eq!(h.app.drop_target_at((panel.right() + 40.0, panel.y + 40.0), &src), None);
+
+    // And the drop really works from the bare panel.
+    h.app.click((a_row.x + 10.0, a_row.y + a_row.h * 0.5), &mut h.r);
+    h.draw();
+    let spot = (h.app.sidebar_blank.x + 10.0, h.app.sidebar_blank.y + 6.0);
+    h.app.mouse = spot;
+    assert!(h.app.tree_drag_update(spot), "the drag did not start");
+    h.app.mouse_up(&mut h.r);
+    h.draw();
+    assert!(dir.join("a.md").exists(), "the file left the root it was already in");
+}
+
+/// (80b) A folder row still lights up - it is the only row that means anything more
+/// specific than the panel - and the root case draws nothing at all.
+#[test]
+fn only_a_folder_row_is_highlighted_for_a_drag() {
+    let (mut h, dir) = tree_harness("r80-highlight", &["a.md"]);
+    let sub = dir.join("sub");
+    let src = dir.join("a.md");
+    h.draw();
+    // Carrying a file over the sub folder: the folder is the target.
+    h.app.tree_drag = Some(bare_md::app::TreeDrag {
+        path: src.clone(),
+        start: (10.0, 10.0),
+        moved: true,
+        over: Some(sub.clone()),
+    });
+    h.draw();
+    let sub_row = h.app.sidebar_rows[tree_row(&h, &sub)];
+    assert!(sub_row.h > 0.0);
+    // Over the root there is no target row to draw, and nothing is invented for it:
+    // the chip does not turn into a box and the bare panel gets no border or caption.
+    const CHROME: &str = include_str!("../src/ui/chrome.rs");
+    assert!(!CHROME.contains("drop in \\"), "the panel still draws a drop caption");
+    assert!(
+        !CHROME.contains("p.stroke(blank"),
+        "the panel still draws a drop border"
+    );
 }
