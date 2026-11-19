@@ -65,6 +65,8 @@ pub enum ToolbarAction {
     ToggleAutoclose,
     /// Turn soft wrap (long lines breaking at the edge) on or off.
     ToggleWrap,
+    /// Show the open document's folder in the workspace panel.
+    RevealInWorkspace,
     ToggleTheme,
     FindReplace,
 }
@@ -180,8 +182,14 @@ pub enum Hit {
     Toolbar(ToolbarAction),
     Tab(usize),
     TabClose(usize),
+    /// The tab strip's scroll affordances.
+    TabScrollLeft,
+    TabScrollRight,
     NewTab,
     SidebarEntry(usize),
+    /// The empty part of the workspace panel below its last row: a right-click
+    /// there makes a new file in the folder the panel is showing.
+    SidebarBlank,
     SidebarUp,
     /// The "open folder" button in the workspace header.
     SidebarOpenFolder,
@@ -251,6 +259,12 @@ pub enum Hit {
     DialogTreeItem(usize),
     /// The disclosure triangle of a tree row (expand / collapse it).
     DialogTreeChevron(usize),
+    /// The rename box's text field and its two buttons.
+    DialogRenameField,
+    DialogRenameOk,
+    /// One entry of the tab's context menu / the tree's context menu.
+    TabMenu(usize),
+    TreeMenu(usize),
     /// The three answers to "this file changed on disk".
     ExternalReload,
     ExternalKeep,
@@ -872,11 +886,62 @@ pub enum Dialog {
         on_yes: ConfirmAction,
     },
     Colour(ColourPicker),
+    /// "Rename …": one text field, a Rename button and a Cancel. Used for a document
+    /// tab and for a file in the workspace tree - both are a path and a name.
+    Rename(RenameBox),
     /// The file behind a tab changed on disk while it was open.
     External(ExternalChange),
     /// What this program is, what it is built from, and the licences - all of them
     /// compiled into the binary, so this box works offline and from a copied `.exe`.
     About(crate::ui::about::About),
+}
+
+/// What a rename is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenameTarget {
+    /// A document tab: the file on disk, and the tab that shows it.
+    Tab(PathBuf),
+    /// A file or folder in the workspace tree.
+    Entry(PathBuf),
+}
+
+/// The rename box: which path it renames, the name being typed, and what went wrong
+/// last time the button was pressed.
+#[derive(Clone, Debug)]
+pub struct RenameBox {
+    pub target: RenameTarget,
+    /// The name as it was, so a failed rename can say what it tried to change.
+    pub original: PathBuf,
+    pub field: crate::field::TextField,
+    pub error: Option<String>,
+}
+
+impl RenameBox {
+    /// A box for `path`, with the current name in the field and the stem - the part
+    /// that is normally edited - selected. Renaming `2026-10-28-plan.md` should start
+    /// at `plan`, not at the date.
+    pub fn new(target: RenameTarget, path: &Path) -> RenameBox {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut field = crate::field::TextField::new();
+        field.set(&name);
+        let stem = name.rfind('.').unwrap_or(name.chars().count());
+        field.anchor = 0;
+        field.caret = stem;
+        RenameBox {
+            target,
+            original: path.to_path_buf(),
+            field,
+            error: None,
+        }
+    }
+
+    /// The name as typed, trimmed. Empty is not a name.
+    pub fn typed(&self) -> String {
+        self.field.as_str().trim().to_string()
+    }
 }
 
 /// "This file changed on disk" - what changed, and what the three answers mean.
@@ -1018,7 +1083,50 @@ pub fn rgb_to_hsv(rgb: u32) -> (f32, f32, f32) {
 #[derive(Clone, Debug)]
 pub enum ConfirmAction {
     CloseTab(usize),
+    /// Remove this path from disk (a file or a folder in the workspace tree).
+    DeletePath(PathBuf),
     Quit,
+}
+
+/// What a right-click on a *tab* offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabMenuAction {
+    CloseOthers,
+    CloseAll,
+    Rename,
+}
+
+/// What a right-click on a file in the workspace tree offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreeMenuAction {
+    /// A new, empty file in the folder the menu was opened on.
+    NewFile,
+    Open,
+    Rename,
+    Duplicate,
+    Copy,
+    Paste,
+    Delete,
+}
+
+/// The open right-click menu of the tab strip or the workspace tree, with the path it
+/// is about (the tree menu) and where it was opened.
+#[derive(Clone, Debug)]
+pub struct ItemMenu<A> {
+    pub at: (f32, f32),
+    /// Index of the tab the menu belongs to (`None` for the tree).
+    pub index: Option<usize>,
+    /// The path the menu is about.
+    pub path: Option<PathBuf>,
+    pub entries: Vec<(String, A)>,
+}
+
+/// A file the user copied or cut in the workspace tree, waiting for a Paste.
+#[derive(Clone, Debug)]
+pub struct TreeClip {
+    pub path: PathBuf,
+    /// True for a cut: the source is removed after a successful copy.
+    pub cut: bool,
 }
 
 /// A workspace tab being dragged along the sidebar's strip.
@@ -1030,6 +1138,13 @@ pub struct WorkspaceDrag {
     pub moved: bool,
     pub start: (f32, f32),
 }
+
+/// How long two clicks on the same row count as a double click, in milliseconds.
+///
+/// The system default is 500; this is deliberately a little shorter, because the
+/// first click of the pair already opened the file and a slow second click on a
+/// tree row should not turn into a rename box.
+pub const DOUBLE_CLICK_MS: u64 = 450;
 
 /// How long a middle-button fling takes to fall to 1/e of its speed, in seconds.
 ///
@@ -1045,6 +1160,27 @@ pub struct TabDrag {
     /// True once the pointer has travelled far enough to count as a drag.
     pub moved: bool,
     pub start: (f32, f32),
+    /// Which tab is under the pointer right now (`None` when it is over the empty
+    /// part of the strip). The strip uses it to keep hover highlights off every
+    /// chip except the one the drag is about.
+    pub hovered: Option<usize>,
+}
+
+/// A file being dragged out of the workspace tree onto a folder in it.
+///
+/// Its own piece of state rather than a flag on something else: a drag has to
+/// survive the pointer leaving the sidebar (that is the whole gesture) and has to
+/// know both where it started and which folder it is over.
+#[derive(Clone, Debug)]
+pub struct TreeDrag {
+    /// The file or folder being moved.
+    pub path: PathBuf,
+    pub start: (f32, f32),
+    /// True once the pointer has travelled far enough to count as a drag rather than
+    /// a click on the row.
+    pub moved: bool,
+    /// The folder under the pointer that would take it, if any.
+    pub over: Option<PathBuf>,
 }
 
 /// What a drag on the minimap grabbed.
@@ -1266,6 +1402,34 @@ pub struct App {
     pub auto_reload: bool,
     /// When the files were last checked for external changes.
     pub disk_check_at: Instant,
+    /// The tab strip's right-click menu, when it is open.
+    pub tab_menu: Option<ItemMenu<TabMenuAction>>,
+    /// The workspace tree's right-click menu, when it is open.
+    pub tree_menu: Option<ItemMenu<TreeMenuAction>>,
+    /// Set when the active tab changed and the strip should scroll to show it on the
+    /// next frame (the geometry it needs is the one the painter produces).
+    pub pending_reveal_tab: bool,
+    /// The tabs a "close others" / "close all" still has to close, while a question
+    /// about one of them is on screen. The list is ascending and is worked from the
+    /// back; answering Cancel drops it.
+    pub pending_close: Option<Vec<usize>>,
+    /// The last file copied or cut in the workspace tree.
+    pub tree_clip: Option<TreeClip>,
+    /// `(path, time)` of the last click in the tree, for double-click recognition -
+    /// a double click on a file renames it.
+    pub tree_click: Option<(PathBuf, Instant)>,
+    /// A file being dragged out of the workspace tree onto one of its folders.
+    pub tree_drag: Option<TreeDrag>,
+    /// Screen rect of every workspace row, in tree order, published by the painter
+    /// for the drag: the input layer never re-derives the row layout.
+    pub sidebar_rows: Vec<Rect>,
+    /// The panel's address chip (the row that names the workspace root - clicking it
+    /// goes up a level). It is the root's own "row", so it is also what a drag drops
+    /// on to put a file back at the top.
+    pub sidebar_root_row: Rect,
+    /// The empty part of the workspace panel below the last row: also the root, for
+    /// a drop.
+    pub sidebar_blank: Rect,
     pub focus: Focus,
     pub dialog: Option<Dialog>,
     pub status: String,
@@ -1301,6 +1465,22 @@ pub struct App {
     pub last_colour: Option<u32>,
     /// Tab rectangles of the last frame, so a tab can be dragged onto another.
     pub tab_rects: Vec<Rect>,
+    /// Right edge of the room the tab chips get, before the view controls of the
+    /// strip begin. Set by the painter every frame; the tab drag and the tests read
+    /// it, so there is one answer for where the strip ends.
+    pub tab_strip_right: f32,
+    /// Left edge of the room the tab chips get. The strip scrolls between here and
+    /// `tab_strip_right`.
+    pub tab_strip_left: f32,
+    /// How far the tab strip is scrolled to the right, in pixels, and the furthest it
+    /// can go. With more tabs than fit, the strip scrolls instead of hiding the new
+    /// ones past its edge - the wheel over the strip, `Shift`+wheel, `Alt`+wheel, or
+    /// a drag anywhere on the strip.
+    pub tab_scroll: f32,
+    pub tab_scroll_max: f32,
+    /// The offset the strip is drawn at this frame: `tab_scroll`, but floored to a
+    /// multiple of a chip's width so the chips sit on whole pixels.
+    pub tab_scroll_drawn: f32,
     /// A tab being dragged along the strip.
     pub tab_drag: Option<TabDrag>,
     /// A workspace tab being dragged along the sidebar strip.
@@ -1345,6 +1525,11 @@ pub struct App {
     kinetic_at: Option<Instant>,
     pub scroll_start: (f32, f32),
     pub initial_files: Vec<PathBuf>,
+    /// Folder of the file this *launch* was given, to be opened in the workspace
+    /// panel once the app is built. Only a fresh launch fills it: a file opened
+    /// later - forwarded from another launch, clicked in the tree, dropped on the
+    /// window - must leave the workspace where it is.
+    pending_startup_folder: Option<PathBuf>,
     /// An in-progress grip drag, if any.
     pub drag: Option<DragState>,
 }
@@ -1402,6 +1587,16 @@ impl App {
             ws_active: 0,
             auto_reload: false,
             disk_check_at: Instant::now(),
+            tab_menu: None,
+            tree_menu: None,
+            pending_reveal_tab: false,
+            pending_close: None,
+            tree_clip: None,
+            tree_click: None,
+            tree_drag: None,
+            sidebar_rows: Vec::new(),
+            sidebar_root_row: Rect::ZERO,
+            sidebar_blank: Rect::ZERO,
             ws,
             focus: Focus::Editor,
             dialog: None,
@@ -1420,6 +1615,11 @@ impl App {
             alt_down: false,
             last_colour: None,
             tab_rects: Vec::new(),
+            tab_strip_right: 0.0,
+            tab_strip_left: 0.0,
+            tab_scroll: 0.0,
+            tab_scroll_max: 0.0,
+            tab_scroll_drawn: 0.0,
             tab_drag: None,
             ws_drag: None,
             ws_tab_rects: Vec::new(),
@@ -1451,6 +1651,7 @@ impl App {
             kinetic_at: None,
             scroll_start: (0.0, 0.0),
             initial_files: files,
+            pending_startup_folder: None,
             drag: None,
             outline_rect: Rect::ZERO,
         };
@@ -1477,8 +1678,14 @@ impl App {
             for f in files {
                 if f.is_dir() {
                     app.ws.set_root(f);
+                    app.pending_startup_folder = None;
                 } else {
                     app.open_path(&f);
+                    // The last file we were launched with decides the folder.
+                    app.pending_startup_folder = f
+                        .parent()
+                        .filter(|d| !d.as_os_str().is_empty() && d.is_dir())
+                        .map(|d| d.to_path_buf());
                 }
             }
             app.active = app.tabs.len().saturating_sub(1);
@@ -1487,6 +1694,22 @@ impl App {
             app.tabs.push(Tab::new(Doc::empty()));
         }
         app.restore_workspaces();
+        // …and only now does the folder of the file we were started on become a
+        // workspace tab: after `restore_workspaces`, because it has to win over the
+        // remembered root for this run, and through `add_workspace`, so the tab list
+        // and `settings.workspaces` stay in step (a bare `ws.set_root` would leave
+        // the previous root claiming to be the current one at the next start).
+        if let Some(dir) = app.pending_startup_folder.take() {
+            let file = app
+                .tabs
+                .iter()
+                .find(|t| t.doc.path.as_ref().and_then(|p| p.parent()) == Some(dir.as_path()))
+                .and_then(|t| t.doc.path.clone());
+            match file {
+                Some(path) => app.attach_folder_of(&path),
+                None => app.add_workspace(dir),
+            }
+        }
         app
     }
 
@@ -1563,6 +1786,687 @@ impl App {
         self.settings.workspace = Some(root);
         self.auto_reload = false;
         self.settings.sidebar_open = true;
+    }
+
+    // ---------- files on disk: rename, duplicate, copy, paste, delete ----------
+
+    /// Open the rename box for a document tab or a tree entry.
+    pub fn open_rename(&mut self, target: RenameTarget) {
+        let path = match &target {
+            RenameTarget::Tab(p) | RenameTarget::Entry(p) => p.clone(),
+        };
+        if !path.exists() {
+            self.set_status(format!("{} is not on disk", path.display()));
+            return;
+        }
+        self.dialog = Some(Dialog::Rename(RenameBox::new(target, &path)));
+        self.focus = Focus::Dialog;
+    }
+
+    /// A name typed into a box, made safe: no separators (a rename must not be a
+    /// move), and no `.` / `..`.
+    fn clean_name(name: &str) -> Option<String> {
+        let n = name.trim();
+        if n.is_empty() || n == "." || n == ".." {
+            return None;
+        }
+        if n.contains('/') || n.contains('\\') || n.contains('\0') {
+            return None;
+        }
+        Some(n.to_string())
+    }
+
+    /// Apply the open rename box. Errors stay in the box - a rename that fails must
+    /// not close the dialog and leave the user wondering.
+    pub fn commit_rename(&mut self) {
+        let Some(Dialog::Rename(mut box_)) = self.dialog.take() else { return };
+        let Some(name) = Self::clean_name(&box_.typed()) else {
+            box_.error = Some("A file name cannot be empty, or contain / or \\".into());
+            self.dialog = Some(Dialog::Rename(box_));
+            self.focus = Focus::Dialog;
+            return;
+        };
+        let from = box_.original.clone();
+        let to = from.with_file_name(&name);
+        if to == from {
+            self.focus = Focus::Editor;
+            return;
+        }
+        if to.exists() {
+            box_.error = Some(format!("\"{name}\" already exists in this folder"));
+            self.dialog = Some(Dialog::Rename(box_));
+            self.focus = Focus::Dialog;
+            return;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {
+                self.after_rename(&box_.target, &from, &to);
+                self.focus = Focus::Editor;
+                self.set_status(format!("renamed to {name}"));
+            }
+            Err(e) => {
+                box_.error = Some(format!("could not rename: {e}"));
+                self.dialog = Some(Dialog::Rename(box_));
+                self.focus = Focus::Dialog;
+            }
+        }
+    }
+
+    /// Put everything that remembered the old path on the new one: the tab (and with
+    /// it the title, the dirty-vs-disk check and the next Save), the workspace
+    /// listing, the recent files and the remembered workspaces.
+    fn after_rename(&mut self, target: &RenameTarget, from: &Path, to: &Path) {
+        // Tabs first: a rename in the tree may also have a tab open on the file, and a
+        // rename of a tab is that same case. Either way, whichever tabs point at
+        // `from` now point at `to`.
+        for t in &mut self.tabs {
+            if t.doc.path.as_deref() == Some(from) {
+                t.doc.path = Some(to.to_path_buf());
+                // The text on screen *is* what is on disk under the new name.
+                t.doc.dirty = false;
+                t.doc.file_gone = false;
+            }
+        }
+        // A folder rename re-points everything under it, including the workspace root.
+        let repoint = |p: &Path| -> PathBuf {
+            match p.strip_prefix(from) {
+                Ok(rest) if p.starts_with(from) => to.join(rest),
+                _ => p.to_path_buf(),
+            }
+        };
+        let new_root = repoint(&self.ws.root);
+        if new_root != self.ws.root {
+            self.ws.set_root(new_root.clone());
+        }
+        self.settings.workspace = Some(self.ws.root.clone());
+        for w in &mut self.settings.workspaces {
+            let n = repoint(w);
+            *w = n;
+        }
+        for r in &mut self.settings.recent {
+            let n = repoint(r);
+            *r = n;
+        }
+        if let RenameTarget::Entry(path) = target {
+            // Re-walk so the tree shows the new name where the old one was, and keep
+            // the folder open if it was a folder.
+            let mut p = path.to_path_buf();
+            p.set_file_name(to.file_name().map(|n| n.to_os_string()).unwrap_or_default());
+            if p.is_dir() {
+                self.ws.expand(&p);
+            }
+            self.ws.reveal(&p);
+        } else {
+            self.ws.reveal(to);
+        }
+        self.invalidate_layouts();
+    }
+
+    /// `notes.md` → `notes copy.md`, `notes copy 2.md`, … until the name is free.
+    fn free_name_in(dir: &Path, file_name: &str) -> PathBuf {
+        let p = Path::new(file_name);
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let mut candidate = dir.join(format!("{stem} copy{ext}"));
+        let mut n = 2;
+        while candidate.exists() {
+            candidate = dir.join(format!("{stem} copy {n}{ext}"));
+            n += 1;
+            if n > 500 {
+                break;
+            }
+        }
+        candidate
+    }
+
+    /// Copy `from` to `to`: files byte for byte, folders recursively.
+    fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+        if from.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                Self::copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            }
+            Ok(())
+        } else {
+            std::fs::copy(from, to).map(|_| ())
+        }
+    }
+
+    /// "Duplicate": a copy next to the original, under a free name, selected in the
+    /// tree afterwards.
+    pub fn duplicate_path(&mut self, path: &Path) {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { return };
+        let Some(dir) = path.parent() else { return };
+        let to = Self::free_name_in(dir, &name);
+        match Self::copy_tree(path, &to) {
+            Ok(()) => {
+                let shown = to
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.ws.refresh();
+                self.ws.reveal(&to);
+                self.set_status(format!("duplicated as {shown}"));
+            }
+            Err(e) => self.set_status(format!("could not duplicate: {e}")),
+        }
+    }
+
+    /// New, empty file in `dir`, opened in a tab.
+    ///
+    /// One entry point for every way in (the tree menu on a row and on the panel's
+    /// empty part), so the name it picks and what it does afterwards - reveal it,
+    /// open it - cannot disagree. The name is `untitled.md`, then `untitled 2.md`, …
+    /// and never overwrites anything: the folder is listed first and only a name that
+    /// is free is taken.
+    pub fn new_file_in(&mut self, dir: &Path) {
+        if !dir.is_dir() {
+            self.set_status("that folder is gone");
+            return;
+        }
+        let mut to = dir.join("untitled.md");
+        let mut n = 2;
+        while to.exists() {
+            to = dir.join(format!("untitled {n}.md"));
+            n += 1;
+            if n > 500 {
+                self.set_status("could not find a free name");
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&to, "") {
+            self.set_status(format!("could not create the file: {e}"));
+            return;
+        }
+        let shown = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        self.ws.refresh();
+        self.ws.expand(dir);
+        self.ws.reveal(&to);
+        self.settings.sidebar_open = true;
+        self.open_path(&to);
+        self.set_status(format!("created {shown}"));
+    }
+
+    /// The folder a drag at `pos` would drop into, if any.
+    ///
+    /// The whole panel takes a drop, so there is nowhere in it a file cannot go:
+    ///
+    /// - over a **folder row** - that folder;
+    /// - over a **file's row** - the folder that file is in;
+    /// - anywhere else in the panel (the bare space below the list, the header, the
+    ///   address chip) - the workspace root, which is how a file gets back out of a
+    ///   folder and into the top of the tree.
+    ///
+    /// Nothing is highlighted for the root case: the panel is one target and the
+    /// only thing that lights up is a row that means something more specific than
+    /// "somewhere". `None` only when the pointer is over the thing being carried or
+    /// (for a folder) over one of its own children.
+    pub fn drop_target_at(&self, pos: (f32, f32), src: &Path) -> Option<PathBuf> {
+        if !self.sidebar_rect.contains(pos) {
+            return None;
+        }
+        let fits = |p: &Path| -> Option<PathBuf> {
+            if !p.is_dir() {
+                return None;
+            }
+            // Only a *folder* can be dropped into its own child. Asking that of a
+            // file would refuse a file the root it already lives under.
+            if src.is_dir() && p.starts_with(src) {
+                return None;
+            }
+            Some(p.to_path_buf())
+        };
+        // A row: a folder is its own target, a file stands for the folder it is in.
+        if let Some(dir) = self.sidebar_rows.iter().enumerate().find_map(|(i, r)| {
+            let e = self.ws.entries().get(i)?;
+            if !r.contains(pos) {
+                return None;
+            }
+            Some(if e.is_dir {
+                e.path.clone()
+            } else {
+                e.path.parent().map(|p| p.to_path_buf())?
+            })
+        }) {
+            return fits(&dir);
+        }
+        fits(&self.ws.root)
+    }
+
+    /// Move `src` (a file or a folder) into the folder `dir` - what dropping it on
+    /// that row in the tree does.
+    ///
+    /// Refuses the three moves that would destroy something: a folder into itself or
+    /// into its own child, and anything into the folder it already lives in. A name
+    /// that is taken in the target gets a free one rather than an overwrite, the same
+    /// rule Paste follows; the tabs showing the moved file follow it to the new path.
+    pub fn move_into_folder(&mut self, src: &Path, dir: &Path) {
+        if !dir.is_dir() || !src.exists() {
+            return;
+        }
+        let name = src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if src.parent().map(|p| p == dir).unwrap_or(false) {
+            return;
+        }
+        if src.is_dir() && dir.starts_with(src) {
+            self.set_status("cannot move a folder into itself");
+            return;
+        }
+        let mut to = dir.join(&name);
+        if to.exists() {
+            let (stem, ext) = match src.extension() {
+                Some(e) => (
+                    src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    format!(".{}", e.to_string_lossy()),
+                ),
+                None => (name.clone(), String::new()),
+            };
+            let mut n = 2;
+            loop {
+                let candidate = dir.join(format!("{stem} {n}{ext}"));
+                if !candidate.exists() || n > 500 {
+                    to = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        let moved = std::fs::rename(src, &to).or_else(|_| {
+            // Across filesystems a rename is a copy and a delete.
+            Self::copy_tree(src, &to).and_then(|_| {
+                if src.is_dir() {
+                    std::fs::remove_dir_all(src)
+                } else {
+                    std::fs::remove_file(src)
+                }
+            })
+        });
+        match moved {
+            Ok(()) => {
+                self.repoint_tabs(src, &to);
+                self.ws.refresh();
+                self.ws.expand(dir);
+                self.ws.reveal(&to);
+                let shown = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                self.set_status(format!("moved to {shown}"));
+            }
+            Err(e) => self.set_status(format!("could not move it: {e}")),
+        }
+    }
+
+    /// Point every tab that is showing `from` (or anything inside it) at `to`.
+    fn repoint_tabs(&mut self, from: &Path, to: &Path) {
+        for t in &mut self.tabs {
+            let Some(p) = t.doc.path.clone() else { continue };
+            let next = if p == from {
+                Some(to.to_path_buf())
+            } else {
+                p.strip_prefix(from).ok().map(|rest| to.join(rest))
+            };
+            if let Some(next) = next {
+                t.doc.path = Some(next);
+                t.doc.dirty = false;
+                t.doc.file_gone = false;
+            }
+        }
+    }
+
+    /// "Copy" in the tree: remembered here, pasted with [`App::paste_into_tree`].
+    ///
+    /// Not the system clipboard that holds the text you copied out of a document: an
+    /// editor whose Copy button on a file either wiped your text or did nothing
+    /// depending on which clipboard it chose is worse than one with its own slot.
+    pub fn copy_tree_item(&mut self, path: &Path, cut: bool) {
+        self.tree_clip = Some(TreeClip { path: path.to_path_buf(), cut });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.set_status(format!("{} {name}", if cut { "cut" } else { "copied" }));
+    }
+
+    /// "Paste": the remembered file goes into `dir` (a folder in the tree) under a
+    /// free name if its own name is taken.
+    pub fn paste_into_tree(&mut self, dir: &Path) {
+        let Some(clip) = self.tree_clip.clone() else {
+            self.set_status("nothing to paste");
+            return;
+        };
+        if !dir.is_dir() {
+            return;
+        }
+        let name = clip
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // Pasting a folder into itself (or into its own child) would copy it into
+        // a hole in the ground.
+        if clip.path.is_dir() && (dir.starts_with(&clip.path)) {
+            self.set_status("cannot paste a folder into itself");
+            return;
+        }
+        let mut to = dir.join(&name);
+        if to.exists() {
+            let (stem, ext) = match to.extension() {
+                Some(e) => (
+                    to.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    format!(".{}", e.to_string_lossy()),
+                ),
+                None => (name.clone(), String::new()),
+            };
+            let mut n = 2;
+            loop {
+                let candidate = dir.join(format!("{stem} {n}{ext}"));
+                if !candidate.exists() || n > 500 {
+                    to = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        let result = if clip.cut {
+            std::fs::rename(&clip.path, &to).or_else(|_| {
+                // A cut across filesystems is a copy and a delete.
+                Self::copy_tree(&clip.path, &to).and_then(|_| {
+                    if clip.path.is_dir() {
+                        std::fs::remove_dir_all(&clip.path)
+                    } else {
+                        std::fs::remove_file(&clip.path)
+                    }
+                })
+            })
+        } else {
+            Self::copy_tree(&clip.path, &to)
+        };
+        match result {
+            Ok(()) => {
+                if clip.cut {
+                    self.tree_clip = None;
+                }
+                self.ws.refresh();
+                self.ws.expand(dir);
+                self.ws.reveal(&to);
+                let shown = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                self.set_status(format!("pasted {shown}"));
+            }
+            Err(e) => self.set_status(format!("could not paste: {e}")),
+        }
+    }
+
+    /// "Delete": asks first, then removes the file (or the folder) from disk, closes
+    /// the tabs that were showing it and re-walks the tree.
+    pub fn ask_delete_path(&mut self, path: &Path) {
+        let what = if path.is_dir() { "folder" } else { "file" };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let open = self.tabs.iter().filter(|t| t.doc.path.as_deref() == Some(path)).count();
+        let mut message = format!("This deletes the {what} \"{name}\" from disk.\nIt does not go to the trash.");
+        if open > 0 {
+            message.push_str(&format!("\n{open} open tab{} will be closed.", if open == 1 { "" } else { "s" }));
+        }
+        self.dialog = Some(Dialog::Confirm {
+            title: format!("Delete {what}"),
+            message,
+            danger: true,
+            on_yes: ConfirmAction::DeletePath(path.to_path_buf()),
+        });
+        self.focus = Focus::Dialog;
+    }
+
+    /// The "yes" half of [`App::ask_delete_path`].
+    pub fn delete_path(&mut self, path: &Path) {
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => {
+                // Tabs showing it have nothing left to save to: close them without
+                // asking (their text is on disk no longer, and the question was just
+                // answered).
+                let doomed: Vec<usize> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        t.doc.path.as_deref() == Some(path)
+                            || t.doc.path.as_deref().map(|p| p.starts_with(path)).unwrap_or(false)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                for i in doomed.into_iter().rev() {
+                    self.tabs.remove(i);
+                }
+                if self.tabs.is_empty() {
+                    self.tabs.push(Tab::new(Doc::empty()));
+                }
+                self.active = self.active.min(self.tabs.len() - 1);
+                if let Some(clip) = &self.tree_clip {
+                    if clip.path == path || clip.path.starts_with(path) {
+                        self.tree_clip = None;
+                    }
+                }
+                self.ws.refresh();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.set_status(format!("deleted {name}"));
+            }
+            Err(e) => self.set_status(format!("could not delete: {e}")),
+        }
+    }
+
+    /// Continue a "close others" / "close all" after the question about one of the
+    /// tabs was answered. The list is ascending and worked from the back.
+    pub fn resume_close(&mut self, rest: Vec<usize>) {
+        self.close_tabs_in_order(rest);
+    }
+
+    // ---------- the tab strip's own scrolling ----------
+
+    /// How far one wheel notch (or one step of a drag) moves the tab strip.
+    ///
+    /// A chip is 84–200 px wide, so a step of half a chip keeps the action readable:
+    /// every notch brings new tabs in, and no notch throws away what you were reading.
+    pub const TAB_SCROLL_STEP: f32 = 64.0;
+
+    /// Move the tab strip by `dx` pixels, clamped to its travel.
+    pub fn scroll_tabs_by(&mut self, dx: f32) {
+        self.tab_scroll = (self.tab_scroll + dx).clamp(0.0, self.tab_scroll_max.max(0.0));
+    }
+
+    /// Scroll the strip just enough to show the active tab.
+    ///
+    /// Called wherever the active tab changes (`Ctrl+Tab`, a new document, a file
+    /// opened from the tree): with more tabs than fit, the one you just switched to
+    /// must not stay hidden behind the edge. The answer is the strip's own geometry,
+    /// taken from the rects of the last frame, so it is exactly what is on screen.
+    pub fn reveal_active_tab(&mut self) {
+        let i = self.active;
+        if i >= self.tab_rects.len() || self.tab_strip_right <= 0.0 {
+            return;
+        }
+        let r = self.tab_rects[i];
+        // The strip's own edges, not the text column's: the tab bar starts further
+        // left than the document's first glyph.
+        let left = self.tab_strip_left + 16.0;
+        let right = self.tab_strip_right - 16.0;
+        if r.x < left {
+            self.scroll_tabs_by(r.x - left);
+        } else if r.right() > right {
+            self.scroll_tabs_by(r.right() - right);
+        }
+    }
+
+    /// The tab strip's open menu, as `(label, action)` pairs, for the hit test and the
+    /// painter to agree on.
+    pub fn tab_menu_entries(&self) -> Vec<(String, TabMenuAction)> {
+        self.tab_menu
+            .as_ref()
+            .map(|m| m.entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// The tree's open menu, as `(label, action)` pairs.
+    pub fn tree_menu_entries(&self) -> Vec<(String, TreeMenuAction)> {
+        self.tree_menu
+            .as_ref()
+            .map(|m| m.entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Open the tree's right-click menu for `path`.
+    pub fn open_tree_menu(&mut self, path: PathBuf, pos: (f32, f32)) {
+        let is_dir = path.is_dir();
+        let mut entries: Vec<(String, TreeMenuAction)> = Vec::new();
+        // "New file" comes first, and it always says where the file will land: on a
+        // folder that is the folder itself, on a file its parent, and on the empty
+        // part of the panel the folder the panel is showing. A command whose target
+        // is not where you think is worse than no command.
+        let dir = if is_dir {
+            path.clone()
+        } else {
+            path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone())
+        };
+        let label = match dir.file_name() {
+            Some(n) => format!("New file in \"{}\"", n.to_string_lossy()),
+            None => "New file".to_string(),
+        };
+        entries.push((label, TreeMenuAction::NewFile));
+        if !is_dir {
+            entries.push(("Open".into(), TreeMenuAction::Open));
+        }
+        entries.push(("Rename".into(), TreeMenuAction::Rename));
+        entries.push(("Duplicate".into(), TreeMenuAction::Duplicate));
+        entries.push(("Copy".into(), TreeMenuAction::Copy));
+        if self.tree_clip.is_some() {
+            entries.push(("Paste".into(), TreeMenuAction::Paste));
+        }
+        entries.push(("Delete".into(), TreeMenuAction::Delete));
+        self.tree_menu = Some(ItemMenu {
+            at: pos,
+            index: None,
+            path: Some(path),
+            entries,
+        });
+    }
+
+    /// Open the tab strip's right-click menu for tab `i`.
+    pub fn open_tab_menu(&mut self, i: usize, pos: (f32, f32)) {
+        // No "Close": the × on the tab is that command, one click away and always in
+        // the same place. A menu that repeats the button next to it is noise.
+        let mut entries = vec![
+            ("Close others".to_string(), TabMenuAction::CloseOthers),
+            ("Close all".to_string(), TabMenuAction::CloseAll),
+        ];
+        let path = self.tabs.get(i).and_then(|t| t.doc.path.clone());
+        // Renaming needs a file: an untitled buffer has no name on disk yet, and
+        // "Save as" is the command that gives it one.
+        if path.is_some() {
+            entries.push(("Rename…".to_string(), TabMenuAction::Rename));
+        }
+        self.tab_menu = Some(ItemMenu {
+            at: pos,
+            index: Some(i),
+            path,
+            entries,
+        });
+    }
+
+    /// Run one entry of the tab strip's menu.
+    pub fn run_tab_menu(&mut self, action: TabMenuAction) {
+        let Some(menu) = self.tab_menu.take() else { return };
+        let Some(i) = menu.index else { return };
+        match action {
+            // `active` follows the tab that was clicked, so "close others" keeps the
+            // one the menu was opened on - not whichever tab happened to be active.
+            TabMenuAction::CloseOthers => {
+                if i < self.tabs.len() {
+                    self.active = i;
+                    self.close_other_tabs(i);
+                }
+            }
+            TabMenuAction::CloseAll => self.close_all_tabs(),
+            TabMenuAction::Rename => {
+                if let Some(path) = menu.path {
+                    self.open_rename(RenameTarget::Tab(path));
+                }
+            }
+        }
+    }
+
+    /// Open the tree's menu for `path` and run one entry - the same path the click
+    /// takes, for tests and for the keyboard.
+    pub fn run_tree_menu_for_test(&mut self, path: PathBuf, action: TreeMenuAction) {
+        self.open_tree_menu(path, (0.0, 0.0));
+        self.run_tree_menu(action);
+    }
+
+    /// Run one entry of the workspace tree's menu.
+    pub fn run_tree_menu(&mut self, action: TreeMenuAction) {
+        let Some(menu) = self.tree_menu.take() else { return };
+        let Some(path) = menu.path else { return };
+        match action {
+            TreeMenuAction::NewFile => {
+                // Into the folder the menu was opened on (or the one holding the
+                // file it was opened on) - the folder whose name the entry showed.
+                let dir = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                };
+                self.new_file_in(&dir);
+            }
+            TreeMenuAction::Open => {
+                if path.is_dir() {
+                    self.ws.toggle(&path);
+                } else {
+                    self.open_path(&path);
+                }
+            }
+            TreeMenuAction::Rename => self.open_rename(RenameTarget::Entry(path)),
+            TreeMenuAction::Duplicate => self.duplicate_path(&path),
+            TreeMenuAction::Copy => self.copy_tree_item(&path, false),
+            TreeMenuAction::Paste => {
+                // Paste goes into the folder the menu was opened on, or into its
+                // parent when it was opened on a file - the folder you can see.
+                let dir = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                };
+                self.paste_into_tree(&dir);
+            }
+            TreeMenuAction::Delete => self.ask_delete_path(&path),
+        }
+    }
+
+    /// Show `path`'s folder in the workspace panel: its own workspace tab, opened
+    /// down to the file.
+    ///
+    /// One implementation for the two ways in - the document menu and the folder a
+    /// *fresh launch* was started on - because the order of these calls is what makes
+    /// it work: `add_workspace` replaces `self.ws` with a freshly walked tree, so the
+    /// reveal has to come after it.
+    pub fn attach_folder_of(&mut self, path: &Path) {
+        let Some(dir) = path.parent().map(|p| p.to_path_buf()) else { return };
+        if dir.as_os_str().is_empty() || !dir.is_dir() {
+            return;
+        }
+        self.add_workspace(dir.clone());
+        self.ws.reveal(path);
+        self.settings.sidebar_open = true;
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| dir.display().to_string());
+        self.set_status(format!("workspace: {name}"));
     }
 
     /// Move workspace tab `i` to position `to`.
@@ -1742,6 +2646,7 @@ impl App {
                 self.settings.push_recent(path);
                 self.ws.reveal(path);
                 self.focus = Focus::Editor;
+                self.pending_reveal_tab = true;
             }
             Err(e) => self.set_status(format!("cannot open {}: {e}", path.display())),
         }
@@ -1751,6 +2656,9 @@ impl App {
         self.tabs.push(Tab::new(Doc::empty()));
         self.active = self.tabs.len() - 1;
         self.focus = Focus::Editor;
+        // A new tab is the newest tab: with a full strip it has to be scrolled into
+        // view, or pressing "+" looks like it did nothing.
+        self.pending_reveal_tab = true;
     }
 
     pub fn close_tab(&mut self, i: usize) {
@@ -1794,6 +2702,66 @@ impl App {
             return;
         }
         self.force_close_tab(i);
+    }
+
+    /// Close every tab but `keep`.
+    ///
+    /// Closing a tab can lose unsaved text, so the ones at risk are asked about -
+    /// the same question the tab's own × asks - and the rest go quietly. Answering
+    /// Cancel stops the whole operation: "close others" that closed half of them and
+    /// then stopped would be the worst of both answers.
+    pub fn close_other_tabs(&mut self, keep: usize) {
+        let order: Vec<usize> = (0..self.tabs.len()).filter(|i| *i != keep).collect();
+        self.close_tabs_in_order(order);
+    }
+
+    /// Close every tab, asking about the ones whose text exists nowhere else.
+    pub fn close_all_tabs(&mut self) {
+        let order: Vec<usize> = (0..self.tabs.len()).collect();
+        self.close_tabs_in_order(order);
+    }
+
+    /// The walk behind "close others" and "close all".
+    ///
+    /// `order` is ascending and is worked from the **back**, so closing one tab never
+    /// renumbers the ones still on the list - a list of indices that is edited while
+    /// tabs disappear is the classic way to close the wrong document. A tab with
+    /// unsaved text stops the walk with a question; the rest of the list rides in
+    /// `pending_close` and continues when the question is answered.
+    fn close_tabs_in_order(&mut self, mut order: Vec<usize>) {
+        while let Some(i) = order.pop() {
+            let Some(tab) = self.tabs.get(i) else { continue };
+            let (dirty, gone) = (tab.doc.dirty, tab.doc.file_gone);
+            if dirty || gone {
+                let title = tab.title();
+                let (heading, message) = match (dirty, gone) {
+                    (true, true) => (
+                        "File deleted",
+                        format!(
+                            "\"{title}\" was deleted from disk and has unsaved changes.\n\
+                             Closing this tab throws the text away for good."
+                        ),
+                    ),
+                    (true, false) => {
+                        ("Unsaved changes", format!("\"{title}\" has unsaved changes."))
+                    }
+                    _ => (
+                        "File deleted",
+                        format!("The file \"{title}\" has been deleted from disk."),
+                    ),
+                };
+                self.pending_close = Some(order);
+                self.dialog = Some(Dialog::Confirm {
+                    title: heading.to_string(),
+                    message,
+                    danger: gone,
+                    on_yes: ConfirmAction::CloseTab(i),
+                });
+                self.focus = Focus::Dialog;
+                return;
+            }
+            self.force_close_tab(i);
+        }
     }
 
     /// Tabs whose text exists nowhere else: unsaved edits, or a file that has been
@@ -2505,6 +3473,7 @@ impl App {
                 Some(&mut cp.slot_mut(bg).hex)
             }
             Some(Dialog::Picker(pk)) => Some(pk.field_mut()),
+            Some(Dialog::Rename(rename)) => Some(&mut rename.field),
             _ => None,
         }
     }
@@ -2516,6 +3485,7 @@ impl App {
                 PickField::Path => &pk.path,
                 PickField::Name => &pk.name,
             }),
+            Some(Dialog::Rename(rename)) => Some(&rename.field),
             _ => None,
         }
     }
@@ -4709,6 +5679,17 @@ impl App {
         }
         entries.push(divider_entry("Save", "Ctrl+S", MenuAction::Edit(EditAction::Save), false));
         entries.push(entry("Save as…", "Ctrl+Shift+S", MenuAction::Edit(EditAction::SaveAs), false));
+        // The folder of what you are editing, as a workspace of its own. Only for a
+        // document that has a folder: an unsaved buffer has none, and an entry that
+        // can only fail is worse than no entry.
+        if self.tab().doc.path.is_some() {
+            entries.push(entry(
+                "Open folder in workspace",
+                "",
+                MenuAction::Toolbar(ToolbarAction::RevealInWorkspace),
+                false,
+            ));
+        }
         entries.push(MenuEntry {
             checked: self.settings.autoclose,
             ..entry(
