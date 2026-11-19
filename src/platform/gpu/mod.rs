@@ -413,7 +413,7 @@ impl Renderer {
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Instance>() as u64,
+                    array_stride: size_of::<Instance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &attrs,
                 })],
@@ -442,7 +442,7 @@ impl Renderer {
         let instance_cap = 4096;
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
-            size: (instance_cap * std::mem::size_of::<Instance>()) as u64,
+            size: (instance_cap * size_of::<Instance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -903,7 +903,7 @@ impl Renderer {
             self.instance_cap = (self.instances.len() * 2).next_power_of_two();
             self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instances"),
-                size: (self.instance_cap * std::mem::size_of::<Instance>()) as u64,
+                size: (self.instance_cap * size_of::<Instance>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
