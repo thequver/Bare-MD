@@ -128,6 +128,58 @@ pub fn draw_dialog(app: &App, p: &mut Painter, dialog: &Dialog, w: f32, h: f32) 
             let b2 = Rect::new(d.right() - 108.0, d.bottom() - 52.0, 84.0, 30.0);
             p.button(b2, "Cancel", true, Hit::DialogCancel);
         }
+        Dialog::Rename(box_) => {
+            let d = Rect::new((w - 460.0) * 0.5, (h - 178.0) * 0.5, 460.0, 178.0);
+            p.panel(d, 10.0, p.theme.bg_elevated, 1.0, p.theme.border_strong);
+            let what = match box_.target {
+                crate::app::RenameTarget::Tab(_) => "Rename document",
+                crate::app::RenameTarget::Entry(_) => "Rename",
+            };
+            p.label(Rect::new(d.x, d.y + 18.0, d.w, 24.0), 24.0, what, Face::Bold, 15.0, p.theme.text);
+            let parent = box_
+                .original
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let parent_shown = ellipsize(p, &parent, Face::Regular, p.theme.ui_small(), d.w - 48.0);
+            p.label(
+                Rect::new(d.x, d.y + 44.0, d.w, 18.0),
+                24.0,
+                &parent_shown,
+                Face::Regular,
+                p.theme.ui_small(),
+                p.theme.text_faint,
+            );
+            let field = Rect::new(d.x + 24.0, d.y + 68.0, d.w - 48.0, 30.0);
+            p.field(
+                field,
+                box_.field.as_str(),
+                "file name",
+                box_.field.selection(),
+                Some(box_.field.caret),
+                true,
+                Hit::DialogRenameField,
+            );
+            // The reason the button did nothing last time, where the eye already is.
+            let note = box_
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("was: {}", box_.original.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+            let bad = box_.error.is_some();
+            let note_shown = ellipsize(p, &note, Face::Regular, p.theme.ui_small(), d.w - 48.0);
+            p.label(
+                Rect::new(d.x, d.y + 104.0, d.w, 18.0),
+                24.0,
+                &note_shown,
+                Face::Regular,
+                p.theme.ui_small(),
+                if bad { p.theme.danger } else { p.theme.text_faint },
+            );
+            let ok = Rect::new(d.right() - 200.0, d.bottom() - 46.0, 84.0, 30.0);
+            p.button(ok, "Rename", false, Hit::DialogRenameOk);
+            let cancel = Rect::new(d.right() - 108.0, d.bottom() - 46.0, 84.0, 30.0);
+            p.button(cancel, "Cancel", true, Hit::DialogCancel);
+        }
         Dialog::Picker(picker) => draw_picker(app, p, picker, w, h),
         Dialog::Colour(cp) => draw_colour_picker(p, cp, w, h),
         Dialog::External(ec) => draw_external_dialog(p, ec, w, h),
@@ -537,7 +589,7 @@ pub fn draw_external_dialog(p: &mut Painter, ec: &crate::app::ExternalChange, w:
 
 /// The About box: the program, its version, and the notices that are compiled into
 /// it - scrolled through with the wheel or the arrow keys.
-pub fn draw_about(p: &mut Painter, about: &crate::ui::about::About, w: f32, h: f32) {
+pub fn draw_about(p: &mut Painter, about: &about::About, w: f32, h: f32) {
     use crate::ui::about as info;
     let d = info::box_rect(w, h);
     p.panel(d, 12.0, p.theme.bg_elevated, 1.0, p.theme.border_strong);

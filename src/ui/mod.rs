@@ -155,6 +155,14 @@ pub fn draw(app: &mut App, r: &mut Renderer) {
     if app.settings.outline_open {
         draw_outline(app, &mut p, ch.outline);
     }
+    // A tab that was just opened (or switched to with `Ctrl+Tab`) is scrolled into
+    // view **before** the strip is painted, using the chip rects of the last frame:
+    // the scroll is a delta against the geometry that was on screen, so applying it
+    // here lands the chip exactly at the edge on this frame - doing it afterwards
+    // always drew one frame of the old offset.
+    if std::mem::take(&mut app.pending_reveal_tab) {
+        app.reveal_active_tab();
+    }
     draw_doc_column(app, &mut p, ch.tabbar, ch.editor, ch.text);
     if app.settings.minimap_open && !ch.minimap.is_empty() {
         draw_minimap(app, &mut p, ch.minimap, ch.text);
@@ -172,6 +180,9 @@ pub fn draw(app: &mut App, r: &mut Renderer) {
     if let Some(menu) = &app.menu {
         draw_menu(menu, &mut p, w, h);
     }
+    // …and so do the two right-click menus (a tab, a row of the tree).
+    draw_tab_menu(app, &mut p, w, h);
+    draw_tree_menu(app, &mut p, w, h);
     // The About box scrolls, so it has to know how many lines it can show before the
     // text is drawn - and a window that got shorter must not leave it scrolled past
     // the end.

@@ -17,6 +17,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("bullet", include_str!("../../assets/icons/bullet.svg")),
     ("check", include_str!("../../assets/icons/check.svg")),
     ("chevron-up", include_str!("../../assets/icons/chevron-up.svg")),
+    ("chevron-left", include_str!("../../assets/icons/chevron-left.svg")),
+    ("chevron-right", include_str!("../../assets/icons/chevron-right.svg")),
     ("chevron", include_str!("../../assets/icons/chevron.svg")),
     ("clear", include_str!("../../assets/icons/clear.svg")),
     ("close", include_str!("../../assets/icons/close.svg")),

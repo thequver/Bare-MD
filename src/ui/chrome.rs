@@ -76,6 +76,78 @@ pub fn draw_menu(menu: &crate::app::Menu, p: &mut Painter, w: f32, h: f32) {
     }
 }
 
+/// A small right-click menu for a tab or a workspace row.
+///
+/// One painter for both, because they are the same thing: a list of labels at a
+/// point, with the row under the pointer filled in. `row_hit` and `panel_hit` differ
+/// only in which `Hit` variant the row registers.
+fn draw_item_menu<A>(
+    p: &mut Painter,
+    w: f32,
+    h: f32,
+    at: (f32, f32),
+    labels: &[(String, A)],
+    row_hit: &dyn Fn(usize) -> Hit,
+    panel_hit: Hit,
+) {
+    let row_h = 24.0;
+    let pad = 5.0;
+    let width = labels
+        .iter()
+        .map(|(l, _)| p.width(l, Face::Regular, p.theme.ui_size()) + 44.0)
+        .fold(140.0f32, f32::max)
+        .min(280.0);
+    let height = labels.len() as f32 * row_h + pad * 2.0;
+    let x = at.0.min(w - width - 8.0).max(8.0);
+    let y = at.1.min(h - height - 8.0).max(8.0);
+    let panel = Rect::new(x, y, width, height);
+    p.round(panel.translate(0.0, 4.0), 10.0, Color::rgba(0.0, 0.0, 0.0, 0.35));
+    p.round(panel, 10.0, p.theme.bg_elevated);
+    p.stroke(panel, 10.0, 1.0, p.theme.border_strong);
+    // The panel first: a click on its own background only dismisses it.
+    p.hit(panel, panel_hit);
+    for (i, (label, _)) in labels.iter().enumerate() {
+        let r = Rect::new(panel.x + 3.0, panel.y + pad + i as f32 * row_h, panel.w - 6.0, row_h);
+        if p.hovered(r) {
+            p.round(r, 6.0, p.theme.bg_hover);
+        }
+        let size = p.theme.ui_size();
+        let b = p.baseline_in(r, size);
+        // "Delete" is the one entry that destroys something.
+        let ink = if label.starts_with("Delete") { p.theme.danger } else { p.theme.text };
+        p.text(r.x + 10.0, b, label, Face::Regular, size, ink);
+        p.hit(r, row_hit(i));
+    }
+}
+
+/// The tab strip's menu, if it is open.
+pub fn draw_tab_menu(app: &App, p: &mut Painter, w: f32, h: f32) {
+    let Some(menu) = &app.tab_menu else { return };
+    draw_item_menu(
+        p,
+        w,
+        h,
+        menu.at,
+        &menu.entries,
+        &|i| Hit::TabMenu(i),
+        Hit::MenuButton(MenuKind::Context),
+    );
+}
+
+/// The workspace tree's menu, if it is open.
+pub fn draw_tree_menu(app: &App, p: &mut Painter, w: f32, h: f32) {
+    let Some(menu) = &app.tree_menu else { return };
+    draw_item_menu(
+        p,
+        w,
+        h,
+        menu.at,
+        &menu.entries,
+        &|i| Hit::TreeMenu(i),
+        Hit::MenuButton(MenuKind::Context),
+    );
+}
+
 /// A menu laid out in two columns (the colour tool: text on the left, background
 /// on the right), each with its own heading.
 pub fn draw_menu_two_columns(menu: &crate::app::Menu, p: &mut Painter, w: f32, h: f32) {
@@ -415,7 +487,10 @@ pub fn chip_close(p: &mut Painter, chip: Rect) -> Rect {
     if hot {
         p.round(cr, 4.0, p.theme.bg_active);
     }
-    p.icon("close", cr.inset(4.5), if hot { p.theme.text } else { p.theme.text_faint });
+    // The glyph fills the button. A 7 px cross inside a 16 px button read as a speck;
+    // the button itself is the size it should be (it is the same in the workspace
+    // tabs and the tests pin the two against each other), so only the ink grew.
+    p.icon("close", cr.inset(1.5), if hot { p.theme.text } else { p.theme.text_faint });
     cr
 }
 
@@ -466,19 +541,139 @@ pub fn tab_dot_center(r: Rect, show_close: bool) -> (f32, f32) {
     (cx, r.y + r.h * 0.5)
 }
 
+/// Height of the view chips in the tab strip.
+pub const CHIP: f32 = 28.0;
+/// Gap the chips put between themselves.
+pub const CHIP_GAP: f32 = 4.0;
+/// The `Live / Live+ / Raw` switch.
+const MODE_W: f32 = 54.0;
+/// The `Find` button.
+const FIND_W: f32 = 40.0;
+
+/// How much of the tab strip's right-hand end belongs to the view controls.
+///
+/// The tabs walk rightwards and the controls walk leftwards into the same strip,
+/// so the strip needs one number for where the controls begin - and it has to be
+/// the **real** width of the lane, not a guess. It was a guessed 220 px, which was
+/// right when the lane held two buttons; with six view chips plus the mode switch
+/// and Find it is more than twice that, and every tab past the guess was drawn on
+/// top of the controls ("when many tabs are open, tabs overlap with find, mode, etc
+/// buttons").
+/// The lane, left to right: Find, the mode switch, then the seven view chips.
+pub const CHIP_COUNT: f32 = 7.0;
+
+pub fn view_lane_w() -> f32 {
+    FIND_W
+        + 6.0
+        + MODE_W
+        + 4.0
+        + CHIP_COUNT * CHIP
+        + (CHIP_COUNT - 1.0) * CHIP_GAP
+        + 10.0
+}
+
+/// Width of the constant lane at each end of the tab strip that the scroll
+/// chevrons live in. Always reserved, so a chip is never under a button and the
+/// strip does not shift when one appears.
+pub const TAB_LANE: f32 = 24.0;
+
+/// Is the pointer over one of the tab strip's scroll chevrons?
+///
+/// The chips cannot ask the hit map (it is being built while they draw), so the
+/// answer is derived from the same numbers the chevrons are drawn with.
+fn over_chevron(rect: Rect, strip_right: f32, sx: f32, max: f32, mouse: (f32, f32)) -> bool {
+    if max <= 0.5 {
+        return false;
+    }
+    let chips_right = (strip_right - TAB_LANE).max(rect.x + TAB_LANE);
+    if sx > 0.5 && Rect::new(rect.x + 6.0, rect.y + 6.0, 16.0, rect.h - 12.0).contains(mouse) {
+        return true;
+    }
+    if sx < max - 0.5
+        && Rect::new(chips_right + 2.0, rect.y + 6.0, 16.0, rect.h - 12.0).contains(mouse)
+    {
+        return true;
+    }
+    false
+}
+
+/// Left edge of the view controls: the tabs may not draw past this.
+pub fn view_lane_left(rect: Rect) -> f32 {
+    (rect.right() - view_lane_w()).max(rect.x + 60.0)
+}
+
 pub fn draw_tabs(app: &mut App, p: &mut Painter, rect: Rect) {
     // No panel colour here: the strip is part of the document surface.
-    let mut x = rect.x + 10.0;
     let size = p.theme.ui_size();
+    // Where the tabs have to stop. Published so the drag and the tests agree with
+    // what is drawn.
+    let lane_left = view_lane_left(rect);
+    let strip_right = (lane_left - 8.0).max(rect.x + 24.0);
+    app.tab_strip_right = strip_right;
     let mut tab_rects: Vec<Rect> = Vec::with_capacity(app.tabs.len());
+
+    // ---- measure every chip, then decide what has to scroll ----
+    // The strip used to simply stop at the lane's edge, which made the view chips
+    // safe but put the newest tabs out of reach. It scrolls now: all the chips are
+    // measured here, and the ones that do not fit are reached by scrolling (wheel
+    // over the strip, `Shift`/`Alt`+wheel, a drag on the strip, the chevrons, or
+    // `Ctrl+Tab` bringing the active tab into view).
+    let widths: Vec<f32> = app
+        .tabs
+        .iter()
+        .map(|t| (p.width(&t.title(), Face::Regular, size) + 46.0).clamp(84.0, 200.0))
+        .collect();
+    let gap = 2.0;
+    // The chips live between two constant lanes: `TAB_LANE` at the left for the
+    // "scroll back" chevron and at the right for "scroll on". The chevrons used to
+    // be pushed in over the chips, so a button sat on top of a tab and the tab under
+    // it lit up on hover; a lane that is always there - whether or not the chevron is
+    // drawn this frame - means a tab can never be underneath one, and the strip does
+    // not jump by 18 px the first time a chevron appears.
+    let chips_left = rect.x + TAB_LANE;
+    let chips_right = (strip_right - TAB_LANE).max(chips_left);
+    let content: f32 = widths.iter().sum::<f32>() + gap * widths.len().max(1) as f32 + 24.0;
+    let room = (chips_right - chips_left).max(0.0);
+    app.tab_scroll_max = (content - room).max(0.0);
+    app.tab_strip_left = chips_left;
+    app.tab_scroll = app.tab_scroll.clamp(0.0, app.tab_scroll_max);
+    // Whole chips only: a strip stopped mid-chip reads as a broken layout, and the
+    // chips stay on whole pixels so the glyphs do not blur.
+    app.tab_scroll_drawn = app.tab_scroll.round();
+    let sx = app.tab_scroll_drawn;
+
+    // A chip can be 200 px wide, so stopping *after* the lane is not enough: the
+    // strip is clipped as well, so nothing a tab draws can reach the controls.
+    // Popped again before this function returns, because the tooltips are painted
+    // later (from `ui::draw`) and would be clipped away with the strip.
+    p.r.push_clip(Rect::new(chips_left, rect.y, (chips_right - chips_left).max(0.0), rect.h));
     for (i, tab) in app.tabs.iter().enumerate() {
         let title = tab.title();
-        let tw = (p.width(&title, Face::Regular, size) + 46.0).clamp(84.0, 200.0);
-        let r = Rect::new(x, rect.y + 6.0, tw, rect.h - 12.0);
+        let tw = widths[i];
+        // Chips left of the scroll offset are off the strip, not squeezed into it.
+        let r = Rect::new(
+            chips_left + (widths[..i].iter().sum::<f32>() + gap * i as f32) - sx,
+            rect.y + 6.0,
+            tw,
+            rect.h - 12.0,
+        );
+        // Every chip is recorded in the tab's *own* slot, on screen or not: `rects[i]`
+        // has to mean tab `i`, or "scroll the active tab into view" and a drag would
+        // both be reading a shifted list as soon as the strip is scrolled.
         tab_rects.push(r);
+        if r.right() < chips_left || r.x > chips_right {
+            continue;
+        }
         let active = i == app.active;
-        let hovered = p.hovered(r);
         let dragging = app.tab_drag.map(|d| d.moved && d.index == i).unwrap_or(false);
+        // Which tab is hot. A tab under a chevron is not hot even though the pointer
+        // is over its rect, and while a tab is being dragged only the one the drag is
+        // about stays lit: the chips are sliding under the pointer, and lighting up
+        // whatever happens to be under it makes the strip flicker through the drag.
+        let hovered = match app.tab_drag {
+            Some(d) if d.moved => d.hovered == Some(i),
+            _ => p.hovered(r) && !over_chevron(rect, strip_right, sx, app.tab_scroll_max, p.mouse),
+        };
         if active || dragging {
             if dragging {
                 p.round(r.translate(0.0, 1.5), 7.0, Color::rgba(0.0, 0.0, 0.0, 0.25));
@@ -516,33 +711,94 @@ pub fn draw_tabs(app: &mut App, p: &mut Painter, rect: Rect) {
             let cr = chip_close(p, r);
             p.hit(cr.inset_xy(-3.0, -2.0), Hit::TabClose(i));
         }
-        x += tw + 2.0;
-        if x > rect.right() - 220.0 {
-            break;
-        }
     }
+    p.r.pop_clip();
     // Published so the input layer can tell which tab a dragged tab is over.
     app.tab_rects = tab_rects;
 
-    // new tab button
-    let nr = Rect::new(x + 2.0, rect.y + 8.0, 22.0, rect.h - 16.0);
-    if p.hovered(nr) {
-        p.round(nr, 5.0, p.theme.bg_hover);
+    // new tab button - at the end of the *content*, so it scrolls with the chips
+    // instead of sitting under the controls.
+    let plus_x = chips_left + widths.iter().sum::<f32>() + gap * widths.len() as f32 - sx;
+    if plus_x + 22.0 > chips_left && plus_x <= chips_right {
+        let nr = Rect::new(plus_x + 2.0, rect.y + 8.0, 22.0, rect.h - 16.0);
+        if p.hovered(nr) {
+            p.round(nr, 5.0, p.theme.bg_hover);
+        }
+        let b = p.baseline_in(nr, size + 4.0);
+        p.text(nr.x + 7.0, b, "+", Face::Regular, size + 4.0, p.theme.text_dim);
+        p.hit(nr, Hit::NewTab);
     }
-    let b = p.baseline_in(nr, size + 4.0);
-    p.text(nr.x + 7.0, b, "+", Face::Regular, size + 4.0, p.theme.text_dim);
-    p.hit(nr, Hit::NewTab);
 
-    // ---- view controls ----
-    // Right-aligned in the strip, next to the document they affect, and each
-    // chip carries a hint because a 14-pixel glyph on its own says very little.
+    // A hairline where the tabs end and the view controls begin, so the two lanes
+    // read as two lanes.
+    p.rect(
+        Rect::new(lane_left - 4.0, rect.y + 9.0, 1.0, rect.h - 18.0),
+        p.theme.border,
+    );
+
+    // ---- scroll affordances ----
+    // Two small chevrons at the ends that have more tabs behind them. **No
+    // scrollbar**: a bar under the chips was noise in a strip that is only one row
+    // tall, and the chevrons say the same thing without a second horizontal line in
+    // the chrome. Each chevron points the way it scrolls - the `chevron` glyph is a
+    // *down* arrow, and using it for "right" is what made both buttons look like
+    // "scroll to the bottom".
+    if app.tab_scroll_max > 0.5 {
+        // One button per side, in that side's lane, and only while that side has
+        // something to show. The lane itself stays empty (and unclickable) when the
+        // chevron is away, so nothing sits on a chip either way.
+        if sx > 0.5 {
+            let l = Rect::new(rect.x + 6.0, rect.y + 6.0, 16.0, rect.h - 12.0);
+            if p.hovered(l) {
+                p.round(l, 5.0, p.theme.bg_active);
+            }
+            p.icon(
+                "chevron-left",
+                Rect::new(l.x + 4.0, l.y + (l.h - 14.0) * 0.5, 8.0, 14.0),
+                if p.hovered(l) { p.theme.text } else { p.theme.text_dim },
+            );
+            p.hit(l, Hit::TabScrollLeft);
+        }
+        if sx < app.tab_scroll_max - 0.5 {
+            let rr = Rect::new(chips_right + 2.0, rect.y + 6.0, 16.0, rect.h - 12.0);
+            if p.hovered(rr) {
+                p.round(rr, 5.0, p.theme.bg_active);
+            }
+            p.icon(
+                "chevron-right",
+                Rect::new(rr.x + 4.0, rr.y + (rr.h - 14.0) * 0.5, 8.0, 14.0),
+                if p.hovered(rr) { p.theme.text } else { p.theme.text_dim },
+            );
+            p.hit(rr, Hit::TabScrollRight);
+        }
+    }
+
     let bh = rect.h - 14.0;
     let by = rect.y + 7.0;
-    let chip = 28.0;
-    let mut rx = rect.right() - 10.0 - chip;
+    // Laid out **left to right from the measured edge of the lane**, so where the
+    // controls sit and where the tabs were told to stop are the same number by
+    // construction (`view_lane_left`). Building the lane right to left and guessing
+    // its width separately is what let the two drift apart.
+    let mut rx = lane_left;
+
+    // Find
+    let find_r = Rect::new(rx, by, FIND_W, bh);
+    if p.hovered(find_r) {
+        p.round(find_r, 6.0, p.theme.bg_hover);
+    }
+    p.label_center(find_r, "Find", Face::Regular, p.theme.ui_size(), p.theme.text_dim);
+    p.hit(find_r, Hit::Toolbar(ToolbarAction::FindReplace));
+    rx = find_r.right() + 6.0;
+
+    // Live -> Live+ -> Raw
+    let mode_r = Rect::new(rx, by, MODE_W, bh);
+    let mode = app.mode;
+    p.button(mode_r, mode.label(), mode != ViewMode::Live, Hit::Toolbar(ToolbarAction::ToggleRaw));
+    rx = mode_r.right() + CHIP_GAP;
+
     let mut chipped = |p: &mut Painter, active: bool, hit: Hit, hint: &str, draw: &dyn Fn(&mut Painter, Rect, Color)| {
-        let r = Rect::new(rx, by, chip, bh);
-        rx -= chip + 4.0;
+        let r = Rect::new(rx, by, CHIP, bh);
+        rx += CHIP + CHIP_GAP;
         let hovered = p.hovered(r);
         if active || hovered {
             p.round(r, 6.0, if active { p.theme.bg_active } else { p.theme.bg_hover });
@@ -555,29 +811,13 @@ pub fn draw_tabs(app: &mut App, p: &mut Painter, rect: Rect) {
             p.tooltip(r, hint);
         }
     };
-    chipped(p, app.settings.theme.is_light(), Hit::Toolbar(ToolbarAction::ToggleTheme), "Theme  (Alt+T)", &|p, r, c| { p.icon("theme", r, c); });
-    chipped(p, app.settings.minimap_open, Hit::Toolbar(ToolbarAction::ToggleMinimap), "Minimap  (Alt+M)", &|p, r, c| { p.icon("minimap", r, c); });
-    chipped(p, app.settings.autoclose, Hit::Toolbar(ToolbarAction::ToggleAutoclose), "Auto-close brackets  (Alt+B)", &|p, r, c| { p.icon("brackets", r, c); });
-    chipped(p, app.settings.wrap, Hit::Toolbar(ToolbarAction::ToggleWrap), "Soft wrap  (Alt+W)", &|p, r, c| { p.icon("wrap", r, c); });
-    chipped(p, app.settings.outline_open, Hit::Toolbar(ToolbarAction::ToggleOutline), "Outline  (Ctrl+Shift+O)", &|p, r, c| { p.icon("outline", r, c); });
-    chipped(p, app.settings.sidebar_open, Hit::Toolbar(ToolbarAction::ToggleSidebar), "Workspace panel  (Ctrl+Shift+E)", &|p, r, c| { p.icon("sidebar", r, c); });
     chipped(p, false, Hit::Toolbar(ToolbarAction::ReloadFile), "Reload from disk", &|p, r, c| { p.icon("reload", r, c); });
-
-    // Live -> Live+ -> Raw
-    rx -= 4.0;
-    let mode_r = Rect::new(rx - 54.0, by, 54.0, bh);
-    rx = mode_r.x;
-    let mode = app.mode;
-    p.button(mode_r, mode.label(), mode != ViewMode::Live, Hit::Toolbar(ToolbarAction::ToggleRaw));
-
-    // Find
-    rx -= 6.0;
-    let find_r = Rect::new(rx - 40.0, by, 40.0, bh);
-    if p.hovered(find_r) {
-        p.round(find_r, 6.0, p.theme.bg_hover);
-    }
-    p.label_center(find_r, "Find", Face::Regular, p.theme.ui_size(), p.theme.text_dim);
-    p.hit(find_r, Hit::Toolbar(ToolbarAction::FindReplace));
+    chipped(p, app.settings.sidebar_open, Hit::Toolbar(ToolbarAction::ToggleSidebar), "Workspace panel  (Ctrl+Shift+E)", &|p, r, c| { p.icon("sidebar", r, c); });
+    chipped(p, app.settings.outline_open, Hit::Toolbar(ToolbarAction::ToggleOutline), "Outline  (Ctrl+Shift+O)", &|p, r, c| { p.icon("outline", r, c); });
+    chipped(p, app.settings.wrap, Hit::Toolbar(ToolbarAction::ToggleWrap), "Soft wrap  (Alt+W)", &|p, r, c| { p.icon("wrap", r, c); });
+    chipped(p, app.settings.autoclose, Hit::Toolbar(ToolbarAction::ToggleAutoclose), "Auto-close brackets  (Alt+B)", &|p, r, c| { p.icon("brackets", r, c); });
+    chipped(p, app.settings.minimap_open, Hit::Toolbar(ToolbarAction::ToggleMinimap), "Minimap  (Alt+M)", &|p, r, c| { p.icon("minimap", r, c); });
+    chipped(p, app.settings.theme.is_light(), Hit::Toolbar(ToolbarAction::ToggleTheme), "Theme  (Alt+T)", &|p, r, c| { p.icon("theme", r, c); });
 }
 
 // ---------------------------------------------------------------- status bar
@@ -722,7 +962,12 @@ pub fn draw_sidebar(app: &mut App, p: &mut Painter, rect: Rect) {
     // Clicking the row steps one level up; no dialog in between.
     let root_path = app.ws.root.display().to_string();
     let rr = Rect::new(rect.x + 6.0, head.bottom() + 28.0, rect.w - 12.0, 26.0);
+    app.sidebar_root_row = rr;
     let root_hot = p.hovered(rr);
+    // Nothing special is drawn here for a drag: the whole panel takes a drop, so a
+    // box around the address row said "this is the target" when the target was in
+    // fact the panel. Only a folder row lights up, because only a folder row means
+    // something more specific than "somewhere in the workspace".
     if root_hot {
         p.round(rr, 6.0, p.theme.bg_hover);
     }
@@ -742,17 +987,42 @@ pub fn draw_sidebar(app: &mut App, p: &mut Painter, rect: Rect) {
     let row_h = 23.0;
     p.r.push_clip(Rect::new(rect.x, y, rect.w, rect.bottom() - y - 6.0));
     let active_path = app.tab().doc.path.clone();
+    // The folder a file being dragged out of this tree would land in, so the row
+    // says "drop it here" before the button comes up.
+    let drop_target = app.tree_drag.as_ref().and_then(|d| {
+        if d.moved {
+            d.over.clone()
+        } else {
+            None
+        }
+    });
+    let mut rows: Vec<Rect> = Vec::with_capacity(app.ws.entries().len());
     for (i, entry) in app.ws.entries().iter().enumerate() {
         if y > rect.bottom() {
             break;
         }
         let indent = 8.0 + entry.depth as f32 * 14.0;
         let r = Rect::new(rect.x + 6.0, y, rect.w - 12.0, row_h);
+        rows.push(r);
         let is_active = active_path.as_deref() == Some(entry.path.as_path());
-        if is_active {
+        // Only a folder row lights up: it is the one row that means something more
+        // specific than the panel's default target.
+        let is_drop = entry.is_dir && drop_target.as_deref() == Some(entry.path.as_path());
+        // The file being carried is dimmed where it sits, the folder that would take
+        // it is outlined: the drag says what it will do before it does it.
+        let carried = app
+            .tree_drag
+            .as_ref()
+            .filter(|d| d.moved)
+            .map(|d| d.path.as_path() == entry.path.as_path())
+            .unwrap_or(false);
+        if is_drop {
+            p.round(r, 6.0, p.theme.bg_active);
+            p.stroke(r, 6.0, 1.0, p.theme.text);
+        } else if is_active {
             p.round(r, 6.0, p.theme.bg_hover);
             p.round(Rect::new(r.x, r.y + 4.0, 2.0, r.h - 8.0), 1.0, p.theme.text);
-        } else if p.hovered(r) {
+        } else if p.hovered(r) && !carried {
             p.round(r, 6.0, p.theme.bg_hover.with_alpha(0.55));
         }
         if entry.is_dir {
@@ -761,9 +1031,9 @@ pub fn draw_sidebar(app: &mut App, p: &mut Painter, rect: Rect) {
         } else {
             p.icon("file", Rect::new(r.x + indent + 14.0, r.y + 6.0, 12.0, 13.0), p.theme.text_faint);
         }
-        let color = if is_active {
-            p.theme.text
-        } else if entry.is_dir {
+        let color = if carried {
+            p.theme.text_faint
+        } else if is_active || entry.is_dir {
             p.theme.text
         } else {
             p.theme.text_dim
@@ -779,6 +1049,19 @@ pub fn draw_sidebar(app: &mut App, p: &mut Painter, rect: Rect) {
         p.text(rect.x + 12.0, y + 14.0, "(listing truncated)", Face::Regular, p.theme.ui_small(), p.theme.text_faint);
     }
     p.r.pop_clip();
+    // The rows are published for the drag (a drop reads them, it does not re-derive
+    // the layout), and the empty part of the panel below them is a target of its own:
+    // a right-click there makes a new file in the folder the panel is showing.
+    app.sidebar_rows = rows;
+    let blank_y = y + if app.ws.truncated { 26.0 } else { 4.0 };
+    let blank = Rect::new(rect.x, blank_y, rect.w, (rect.bottom() - blank_y).max(0.0));
+    app.sidebar_blank = if blank.h > 0.0 { blank } else { Rect::ZERO };
+    if blank.h > 0.0 {
+        // No box and no caption here: the empty part of the panel is simply part of
+        // the panel, and dropping on it means the workspace root like everything
+        // else that is not a folder row.
+        p.hit(blank, Hit::SidebarBlank);
+    }
 }
 
 // ---------------------------------------------------------------- outline
