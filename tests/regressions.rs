@@ -9596,3 +9596,88 @@ fn only_a_folder_row_is_highlighted_for_a_drag() {
         "the panel still draws a drop border"
     );
 }
+
+// ---------------------------------------------------------------- round 81
+
+/// (81) A selection across three wrapped left-to-right rows must wash each row to
+/// *its own* end, not to the widest point of the paragraph.
+///
+/// The right edge of a fully selected row came from `row_width_of`, which answers
+/// "how wide is the whole line" for anything that is not a bidi row (that number is
+/// what the paragraph alignment needs). So the middle row of a plain English
+/// paragraph was washed from the left margin to the widest row of the line - a
+/// solid bar running out over the rest of the page, which is what "the highlight
+/// displays backwards" looked like. Copying and deleting were never wrong: they use
+/// the character range, not the geometry.
+#[test]
+fn a_selection_across_wrapped_rows_stops_at_each_rows_own_end() {
+    let mut h = harness("r81-sel-rows");
+    h.app.insert_text(
+        "This paragraph has **bold words** in the middle of it and keeps going for long \
+         enough that it must wrap onto a second row for sure, and then a third, and a \
+         fourth one after that so the middle is unmistakably fully selected.",
+    );
+    h.draw();
+    let line = h.app.tab().layout.lines[0].clone();
+    assert!(line.row_count() >= 3, "the fixture did not wrap: {} rows", line.row_count());
+    let n = line.chars.len();
+    // Select from inside the first row to inside the last: everything in between is
+    // selected in full.
+    let (a, b) = (4, n - 4);
+    h.app.select_range(a, b);
+    h.draw();
+    let tab = h.app.tab();
+    let line = &tab.layout.lines[0];
+    let raw = tab.line_is_raw(h.app.mode, 0) || tab.table_shows_markers(h.app.mode, 0);
+    let spans = line.row_span(&mut h.r.text, a, b, raw);
+    assert!(spans.len() >= 3, "the spans do not cover three rows: {spans:?}");
+
+    // Every fully selected row is as wide as its own text, never wider.
+    for (ri, lo, hi) in &spans {
+        let own = line.row_text_width(&mut h.r.text, *ri, raw);
+        assert!(
+            (hi - lo) <= own + 1.0,
+            "row {ri} was washed {} px wide but its text is {own} px: a row ran past \
+             its own end",
+            hi - lo
+        );
+        assert!(hi > lo, "row {ri} was washed to nothing: {lo}..{hi}");
+    }
+    // The middle row is the longest one; a bar past the view is the bug.
+    let widest = spans.iter().map(|(_, lo, hi)| hi - lo).fold(0.0f32, f32::max);
+    assert!(
+        widest <= h.app.text_rect.w + 1.0,
+        "a wash is {widest} px wide in a {} px column",
+        h.app.text_rect.w
+    );
+}
+
+/// (81b) …and the same for a line whose source is on screen (markers revealed and
+/// hidden measure differently, so both variants have to answer for themselves).
+#[test]
+fn a_revealed_rows_selection_is_no_wider_than_its_text() {
+    let mut h = harness("r81-sel-rows-raw");
+    h.app.insert_text(
+        "A line with **markers** in it, long enough to wrap over a couple of rows so \
+         that a fully selected row can be measured against its own text width.",
+    );
+    h.draw();
+    // Put the caret on the line, which is what shows its markers.
+    h.app.select_range(0, 0);
+    h.draw();
+    let n = h.app.tab().layout.lines[0].chars.len();
+    h.app.select_range(2, n - 2);
+    h.draw();
+    let tab = h.app.tab();
+    let line = &tab.layout.lines[0];
+    for raw in [false, true] {
+        for (ri, lo, hi) in line.row_span(&mut h.r.text, 2, n - 2, raw) {
+            let own = line.row_text_width(&mut h.r.text, ri, raw);
+            assert!(
+                (hi - lo) <= own + 1.0,
+                "raw={raw} row {ri}: wash {} px against {own} px of text",
+                hi - lo
+            );
+        }
+    }
+}
