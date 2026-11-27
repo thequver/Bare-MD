@@ -661,6 +661,27 @@ impl LineLayout {
         }
     }
 
+    /// Width of the text a visual row actually paints, in that row's own
+    /// coordinates (0 = the row's left edge).
+    ///
+    /// [`LineLayout::row_width_of`] answers a different question - how far the row
+    /// is *shifted* (it is the whole line's width for anything that is not a bidi
+    /// row, because that is what the paragraph alignment needs). Using it as a
+    /// selection's right edge washed a fully selected middle row from the left
+    /// margin to the widest point of the whole paragraph: a solid bar running out
+    /// over the rest of the page, on a paragraph that is plain left-to-right prose.
+    pub fn row_text_width(&self, te: &mut TextEngine, ri: usize, raw: bool) -> f32 {
+        // A bidirectional line already records where each row's runs start and end,
+        // in the row's own coordinates - that number is the row's extent, and it is
+        // the only one that works when the text runs right to left.
+        if self.bidi_row_runs(ri, raw).is_some() {
+            return self.row_width_of(ri, raw);
+        }
+        let Some(row) = self.rows.get(ri).copied() else { return 0.0 };
+        let base = self.x_abs(te, row.start, raw);
+        (self.x_abs(te, row.end, raw) - base).max(0.0)
+    }
+
     /// Like [`LineLayout::align_offset`], but measured per visual row.
     ///
     /// A right-to-left paragraph starts at the **right** margin, the way `dir=rtl`
@@ -933,6 +954,11 @@ impl LineLayout {
         }
         let row = self.row(self.row_of_local_in(local, raw));
         let base = self.x_abs(te, row.start, raw);
+        // The answer is only meaningful *inside* one row: a boundary offset belongs
+        // to the row before it (`row_of_local_in`), and the plain subtraction then
+        // returns 0 for the end of every wrapped row. Anything that needs a row's own
+        // width wants [`LineLayout::row_text_width`], which measures the row's own
+        // start and end.
         self.x_abs(te, local, raw) - base
     }
 
@@ -967,7 +993,7 @@ impl LineLayout {
             }
             let full = a <= row.start && b >= row.end;
             let (lo, hi) = if full {
-                (0.0, self.row_width_of(ri, raw))
+                (0.0, self.row_text_width(te, ri, raw))
             } else {
                 let xa = self.x_of(te, ra, raw);
                 let xb = self.x_of(te, rb, raw);
